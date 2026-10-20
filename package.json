@@ -1,0 +1,15 @@
+{
+  "name": "finrl-trader-frontend",
+  "version": "2.0.0",
+  "private": true,
+  "description": "FinRL Trader V2 frontend — static assets served by FastAPI backend or Cloudflare Pages",
+  "scripts": {
+    "dev": "echo 'Serve trader/frontend/ via any static file server; API at http://127.0.0.1:8000'",
+    "build": "node scripts/build_frontend.js",
+    "build:pages": "node scripts/build_frontend.js",
+    "deploy:pages": "npm run build:pages && wrangler pages deploy dist --project-name finrl-trader"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

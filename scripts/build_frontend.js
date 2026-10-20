@@ -48,6 +48,23 @@ function main() {
     process.exit(1);
   }
 
+  // Guard against accidental same-origin production builds. An empty API base is
+  // correct ONLY when the FastAPI backend serves this frontend itself. On a
+  // separate host (Cloudflare Pages) it produces a dashboard whose API calls all
+  // 404. Set ALLOW_SAME_ORIGIN=1 to acknowledge/self-host deliberately.
+  const allowSameOrigin = ["1", "true", "yes"].includes(
+    (process.env.ALLOW_SAME_ORIGIN || "").trim().toLowerCase()
+  );
+  if (!apiBase && !allowSameOrigin) {
+    console.warn(
+      "build_frontend: WARNING - API_BASE_URL is empty, so the dashboard will call\n" +
+        "  its own origin. That only works when the backend serves this frontend\n" +
+        "  (self-hosted). For Cloudflare Pages set API_BASE_URL to the Railway origin,\n" +
+        "  e.g. API_BASE_URL=https://<project>.up.railway.app\n" +
+        "  Set ALLOW_SAME_ORIGIN=1 to silence this warning."
+    );
+  }
+
   fs.rmSync(OUT, { recursive: true, force: true });
   copyDir(SRC, OUT);
 

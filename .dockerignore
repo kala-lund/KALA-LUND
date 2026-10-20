@@ -1,0 +1,46 @@
+# Credentials and secrets - never in the image
+.env
+.env.*
+!.env.example
+
+# Local virtual environment
+.venv/
+venv/
+
+# Per-session error logs (runtime only)
+errors/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Logs and runtime artifacts
+*.log
+uvicorn.err
+uvicorn.out
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OpenCode agent tooling (not needed in image)
+.opencode/
+AGENTS.md
+docs/agent-memory/

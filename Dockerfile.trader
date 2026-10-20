@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+WORKDIR /srv/finrl
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (Trader V2 API - minimal set)
+COPY requirements-api.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements-api.txt
+
+# Copy application code
+COPY trader ./trader
+COPY scripts ./scripts
+
+# Paper-only trading enforcement
+ENV TRADING_MODE=paper
+ENV ENABLE_PAPER_ORDERS=false
+ENV ENABLE_LIVE_TRADING=false
+ENV API_HOST=0.0.0.0
+# API_PORT is intentionally NOT hardcoded: Railway assigns $PORT dynamically,
+# and config.py reads PORT (after API_PORT, WEB_PORT) as the listen port.
+EXPOSE 8000
+
+CMD ["python", "scripts/run_trader.py"]

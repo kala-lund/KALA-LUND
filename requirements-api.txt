@@ -1,0 +1,26 @@
+# Trader V2 API - minimal runtime dependencies
+# Upstream FinRL dependencies remain in requirements.txt (untouched).
+# Only packages imported by trader/ and scripts/run_trader.py are listed.
+
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.5
+python-dotenv>=1.0
+
+# Market data providers
+# alpaca-py==0.44 verified working in TEST_HISTORY (2026-10-14, TimeFrame fix).
+# Alpaca is the DEFAULT provider (DATA_PROVIDER=alpaca).
+alpaca-py==0.44
+
+# OPTIONAL: CCXT multi-exchange provider (DATA_PROVIDER=ccxt).
+# Lazily imported in trader/data/market.py, unused by the default Alpaca path,
+# and referenced by no test. Excluded from the default install because it pulls
+# ~61 MB plus ~14 MB of transitive native wheels (cryptography, coincurve,
+# aiohttp, aiodns, yarl). Enable only when you actually need CCXT:
+#   pip install ccxt
+# ccxt>=1.66.32
+
+# Optional services with graceful fallback if not configured
+anthropic>=0.30
+redis>=5.0
+psycopg2-binary>=2.9

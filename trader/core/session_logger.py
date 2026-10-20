@@ -115,10 +115,16 @@ def _session_file(session_id: int, errors_dir: Path) -> str:
 def _sanitize_traceback(exc: Optional[BaseException]) -> str:
     if exc is None:
         return ""
-    lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-    tb = "".join(lines)
     from .kit import safe_msg  # lazy to avoid circular import at module load
 
+    if not isinstance(exc, BaseException):
+        # trader.core.kit.log() forwards an already-sanitized *string* (safe_msg).
+        # Accessing .__traceback__ on it raised AttributeError, which was
+        # swallowed upstream and silently dropped error entries from the session
+        # audit log. Treat non-exception input as message text and never lose it.
+        return safe_msg(Exception(str(exc)))
+    lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    tb = "".join(lines)
     tb = safe_msg(Exception(tb))  # redact secret-like substrings
     return tb
 

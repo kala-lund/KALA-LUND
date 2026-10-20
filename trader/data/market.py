@@ -111,7 +111,15 @@ class CcxtProvider(Provider):
     def _e(self):
         if self._ex is not None:
             return self._ex
-        import ccxt
+        try:
+            import ccxt
+        except ImportError as exc:
+            # ccxt is an OPTIONAL dependency (default provider is Alpaca).
+            # Fail with an actionable message instead of a bare ImportError.
+            raise RuntimeError(
+                "DATA_PROVIDER=ccxt requires the optional 'ccxt' package. "
+                "Install it with: pip install ccxt"
+            ) from exc
         return getattr(ccxt, self._id)({"enableRateLimit": True})
 
     def fetch(self, symbol: str, timeframe: str, start_ms: int, end_ms: int) -> list[dict]:
