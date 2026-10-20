@@ -1,0 +1,20 @@
+# Cloudflare Pages configuration - FinRL Trader V2 frontend.
+#
+# The frontend is plain static HTML/CSS/JS (no bundler, no npm dependencies).
+# The Python/FastAPI backend stays on Railway - it is NOT deployed to Workers.
+#
+# Build command : node scripts/build_frontend.js
+# Output directory: dist
+#
+# Environment variable (set in the Cloudflare Pages dashboard):
+#   API_BASE_URL - origin of the Railway backend, e.g. https://<project>.up.railway.app
+#                  It is written into dist/config.js and used by the dashboard
+#                  to build API URLs. Leave empty only for same-origin hosting.
+#
+# `npx wrangler pages deploy dist --project-name finrl-trader`
+
+name = "finrl-trader"
+compatibility_date = "2026-10-17"
+
+# Directory that `wrangler pages deploy` uploads. Must match the build output.
+pages_build_output_dir = "dist"

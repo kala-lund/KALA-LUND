@@ -33,6 +33,102 @@ This repository contains the original FinRL library for education, benchmarking,
 
 For the next-generation AI-native and production-oriented trading stack, please visit **[FinRL-X / FinRL-Trading](https://github.com/AI4Finance-Foundation/FinRL-Trading)**.
 
+---
+
+## FinRL Trader V2 (paper-trading service in this repository)
+
+This fork additionally ships **FinRL Trader V2**: a FastAPI service (`trader/`) with a
+vanilla-JS dashboard (`trader/frontend/`), an independent fail-closed risk guard, an
+Alpaca **paper**-only broker adapter, and a PostgreSQL/Supabase-backed store.
+
+> **Paper trading only.** Live trading is prohibited in code: `TRADING_MODE` must be
+> `paper`, `ENABLE_LIVE_TRADING` must be `false`, and the broker refuses any base URL
+> that is not the approved Alpaca paper endpoint.
+
+### 1. Setup
+
+```bash
+python -m venv .venv                 # Windows: .venv\Scripts\activate
+pip install -r requirements-api.txt  # minimal API runtime (FastAPI/uvicorn/alpaca-py/ccxt)
+pip install pytest httpx             # only needed to run the tests
+cp .env.example .env                  # then fill in your own values (never commit .env)
+```
+
+`requirements-api.txt` holds the minimal runtime set. The full upstream FinRL
+dependency set stays in `requirements.txt` and is unchanged.
+
+### 2. Configuration
+
+All configuration is environment based; `.env.example` documents every supported
+name. Secrets are never read from source and are never logged.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `TRADING_MODE` | yes | must be `paper` |
+| `ENABLE_LIVE_TRADING` | yes | must be `false` |
+| `ENABLE_PAPER_ORDERS` | no | `true` permits **paper** order submission (needs Alpaca paper keys) |
+| `ALPACA_API_KEY` / `ALPACA_API_SECRET` | for market data + paper orders | Alpaca **paper** credentials |
+| `ALPACA_PAPER_BASE_URL` | no | defaults to `https://paper-api.alpaca.markets` |
+| `CRYPTO_SYMBOLS` | no | comma-separated list, or `ALL` |
+| `PRIMARY_TIMEFRAME` | no | e.g. `15Min` |
+| `API_HOST` / `API_PORT` | no | defaults `127.0.0.1` / `8000`; `PORT` is also honoured (Railway) |
+| `CORS_ORIGINS` | yes in production | comma-separated frontend origins |
+| `DASHBOARD_PASSWORD` | strongly recommended | gates order / kill-switch / automation endpoints |
+| `DATABASE_URL` | yes in production | PostgreSQL/Supabase DSN for durable order/signal state |
+| `REQUIRE_DURABLE_STORE` | yes in production | `true` refuses to start without a working database |
+| `REDIS_URL` | no | optional cache; falls back to an in-process cache |
+| `CLAUDE_ENABLED` / `CLAUDE_API_KEY` | no | optional Muse AI decision support (fail-closed) |
+| `MAX_ORDER_NOTIONAL`, `MAX_POSITION_NOTIONAL`, `MAX_PORTFOLIO_EXPOSURE`, `MAX_CONCENTRATION_PCT`, `MAX_DAILY_LOSS`, `MAX_DRAWDOWN_PCT`, `MAX_OPEN_ORDERS`, `MIN_BUYING_POWER`, `STALE_DATA_SECONDS` | no | risk limits (defaults in `trader/core/config.py`) |
+
+### 3. Run locally
+
+```bash
+python scripts/run_trader.py          # serves the API and the dashboard at /
+# -> http://127.0.0.1:8000/
+```
+
+`scripts/run_trader.py` validates the configuration first and exits non-zero with
+the blocking errors if anything is unsafe (e.g. live mode requested).
+
+### 4. Testing
+
+```bash
+python -m pytest trader/tests -q       # Trader V2 unit + API tests (mocked broker)
+python -m pytest backend/tests -q      # backend app tests
+python -m compileall -q trader scripts backend/app
+```
+
+The test suites use mocked brokers and fixtures; they never require broker
+credentials, network access, or a live market. GitHub Actions runs the same
+commands on Python 3.11 (`.github/workflows/ci.yml`).
+
+### 5. Deployment
+
+| Target | What is deployed | Config |
+|---|---|---|
+| **Railway** | FastAPI backend (`scripts/run_trader.py`) | `railway.toml`, `Dockerfile.trader` |
+| **Cloudflare Pages** | static dashboard only | `wrangler.toml`, `scripts/build_frontend.js` |
+
+The Python backend stays on Railway — it is not deployed to Cloudflare Workers.
+
+- Backend guide: [`docs/DEPLOYMENT_RAILWAY.md`](docs/DEPLOYMENT_RAILWAY.md)
+- Frontend guide: [`docs/DEPLOYMENT_CLOUDFLARE.md`](docs/DEPLOYMENT_CLOUDFLARE.md)
+- Production checklist: [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md)
+
+### 6. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `Blocking configuration errors: ...` on startup | `validate_settings()` rejected the config (live mode, wrong Alpaca URL, or missing credentials). Fix the reported variable. |
+| `REQUIRE_DURABLE_STORE is set but DATABASE_URL is missing` | Set `DATABASE_URL` (Railway service variable) or unset `REQUIRE_DURABLE_STORE` locally. |
+| Dashboard shows `Connecting…` / CORS error in the browser console | `CORS_ORIGINS` does not contain the frontend origin. For Cloudflare Pages set it to the `*.pages.dev` domain. |
+| Dashboard loads but every API call 404s (Pages only) | The Pages build must set `API_BASE_URL` to the Railway origin; the build writes it into `dist/config.js`. |
+| `/api/v2/health` returns `"ok": false` | `components.config.detail` names the blocking configuration error; `components.risk_kill` shows an engaged kill switch. |
+| Orders rejected with `Account unknown; failing closed` | The risk guard could not read a fresh account snapshot (stale data or missing credentials). It is designed to fail closed. |
+| Railway service restarts repeatedly | The container exits on invalid configuration by design. Check the deploy logs; do not disable the validation. |
+
+---
+
 ## FinRL Ecosystem Roadmap
 
 | Generation | Positioning | Target Users | Repository | Description |

@@ -1,0 +1,48 @@
+# Railway deployment configuration - FinRL Trader V2 backend.
+#
+# Entry point: scripts/run_trader.py -> uvicorn trader.api.server:app
+# (verified: scripts/run_trader.py reads API_HOST / API_PORT / PORT from
+#  trader/core/config.py and calls uvicorn.run(..., host=..., port=...))
+#
+# Health check: GET /api/v2/health -> HTTP 200
+# (verified route in trader/api/server.py; returns {"ok":..., "mode":"paper", ...})
+#
+# NOTE: secrets (ALPACA_API_KEY, ALPACA_API_SECRET, DATABASE_URL, REDIS_URL,
+# DASHBOARD_PASSWORD, CLAUDE_API_KEY) must be set as Railway service variables
+# in the dashboard - never committed here.
+
+[deploy]
+  startCommand = "python scripts/run_trader.py"
+  healthcheckPath = "/api/v2/health"
+  healthcheckTimeout = 60
+  restartPolicyType = "on_failure"
+  restartPolicyMaxRetries = 10
+
+[build]
+  # Railway does not auto-detect non-standard Dockerfile names.
+  dockerfilePath = "Dockerfile.trader"
+
+[deploy.environment]
+  # Hard safety defaults. Live trading is prohibited; paper mode only.
+  TRADING_MODE = "paper"
+  ENABLE_PAPER_ORDERS = "false"
+  ENABLE_LIVE_TRADING = "false"
+  # Bind to every interface so Railway can route traffic to the container.
+  API_HOST = "0.0.0.0"
+  # PORT is assigned dynamically by Railway. trader/core/config.py resolves the
+  # listen port as API_PORT -> WEB_PORT -> PORT -> 8000.
+  #
+  # REQUIRE_DURABLE_STORE=true makes the service refuse to start unless
+  # DATABASE_URL is set AND the PostgreSQL connection succeeds, so production
+  # order/signal state is never silently kept in ephemeral in-memory storage.
+  REQUIRE_DURABLE_STORE = "true"
+
+# Required Railway service variables (set in the dashboard, names only):
+#   DATABASE_URL        - PostgreSQL/Supabase DSN (required: durable order state)
+#   CORS_ORIGINS       - comma-separated frontend origins, e.g. https://<project>.pages.dev
+#   DASHBOARD_PASSWORD  - gates order / kill-switch / automation endpoints
+#   ALPACA_API_KEY      - Alpaca PAPER key id (optional until market data is needed)
+#   ALPACA_API_SECRET   - Alpaca PAPER secret (optional until market data is needed)
+#   REDIS_URL           - optional Redis cache (falls back to in-process cache)
+#   CLAUDE_ENABLED      - optional Muse AI decision support (default false)
+#   CLAUDE_API_KEY      - optional Muse AI key

@@ -1,0 +1,14 @@
+# Cloudflare Pages routing rules (trader/frontend/_redirects)
+#
+# The dashboard HTML references its assets under /static/ because that is where
+# the FastAPI backend mounts the static directory. On Cloudflare Pages the same
+# files are served from the site root, so map them explicitly.
+#
+# Order matters: explicit asset rules must come before the SPA catch-all.
+
+/static/config.js   /config.js   200
+/static/styles.css  /styles.css  200
+/static/app.js      /app.js      200
+
+# SPA fallback for client-side routing.
+/*                 /index.html   200

@@ -1,6 +1,14 @@
 # Custom config
 #results/
 
+# Secrets - never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Per-session error logs (runtime, never commit)
+errors/
+
 # remove DS_Store
 **/.DS_Store
 
@@ -107,14 +115,6 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
-# Environments
-# .env
-# .venv
-# env/
-# venv/
-# ENV/
-# env.bak/
-# venv.bak/
 
 # Spyder project settings
 .spyderproject
@@ -147,3 +147,78 @@ papertrading_test.py
 alpaca_processor_test.py
 /finrl/config_private.py
 .history/
+
+
+
+
+
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Optional: Ignore all .env files except examples/templates
+!.env.example
+!.env.template
+
+# ===== Deployment / local artifacts (GitHub readiness) =====
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches / build artifacts
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Cloudflare tooling
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Local databases and session state (must never be committed)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# Logs and process output
+*.log
+uvicorn.out
+uvicorn.err
+
+# Generated training / research artifacts
+reports/
+trained_models/
+tensorboard_log/
+datasets/
+
+# Local scratch files (see KNOWN_ISSUES / docs)
+audit.txt
+New Text Document.txt
+1.66.32
+_diag_supabase.py
+FinRL-Development-Prompt.txt
+test_v2_api.py
+Fix-OmniRush-Paste.cmd
+Start-OmniRush-FinRL.bat
+*.bak
+
+# Third-party capability pack (distribution artifact, not application source)
+OpenCode_FinRL_Claude_Capability_Pack/
+
+# Private infrastructure architecture notes (contain service hostnames)
+docs/architecture-v2.11.9/
+
+# Model / research binary artifacts
+*.pkl
+*.pth
+*.npy
