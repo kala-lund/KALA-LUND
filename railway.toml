@@ -7,42 +7,45 @@
 # Health check: GET /api/v2/health -> HTTP 200
 # (verified route in trader/api/server.py; returns {"ok":..., "mode":"paper", ...})
 #
-# NOTE: secrets (ALPACA_API_KEY, ALPACA_API_SECRET, DATABASE_URL, REDIS_URL,
-# DASHBOARD_PASSWORD, CLAUDE_API_KEY) must be set as Railway service variables
-# in the dashboard - never committed here.
-
-[deploy]
-  startCommand = "python scripts/run_trader.py"
-  healthcheckPath = "/api/v2/health"
-  healthcheckTimeout = 60
-  restartPolicyType = "on_failure"
-  restartPolicyMaxRetries = 10
-
-[build]
-  # Railway does not auto-detect non-standard Dockerfile names.
-  dockerfilePath = "Dockerfile.trader"
-
-[deploy.environment]
-  # Hard safety defaults. Live trading is prohibited; paper mode only.
-  TRADING_MODE = "paper"
-  ENABLE_PAPER_ORDERS = "false"
-  ENABLE_LIVE_TRADING = "false"
-  # Bind to every interface so Railway can route traffic to the container.
-  API_HOST = "0.0.0.0"
-  # PORT is assigned dynamically by Railway. trader/core/config.py resolves the
-  # listen port as API_PORT -> WEB_PORT -> PORT -> 8000.
-  #
-  # REQUIRE_DURABLE_STORE=true makes the service refuse to start unless
-  # DATABASE_URL is set AND the PostgreSQL connection succeeds, so production
-  # order/signal state is never silently kept in ephemeral in-memory storage.
-  REQUIRE_DURABLE_STORE = "true"
-
-# Required Railway service variables (set in the dashboard, names only):
-#   DATABASE_URL        - PostgreSQL/Supabase DSN (required: durable order state)
-#   CORS_ORIGINS       - comma-separated frontend origins, e.g. https://<project>.pages.dev
+# SCHEMA NOTE (verified against https://docs.railway.com/reference/config-as-code
+# and the live https://railway.com/railway.schema.json):
+#   * Only the [build], [deploy] and [environments] tables (plus $schema) are
+#     valid here.
+#   * restartPolicyType must be one of ON_FAILURE / ALWAYS / NEVER (upper case).
+#   * Environment variables CANNOT be set from this file. An earlier revision
+#     declared them in a [deploy.environment] table, which is not part of the
+#     schema; those values were silently never applied. Safety defaults now live
+#     in Dockerfile.trader (ENV) and every remaining variable must be set as a
+#     Railway service variable in the dashboard.
+#   * Config-as-code is deprecated upstream (existing files keep working until
+#     2026-12-01). Revisit / migrate to Infrastructure as Code before that date.
+#
+# Required Railway service variables (dashboard, names only):
+#   DATABASE_URL        - Supabase *Session Pooler* DSN (required: durable state).
+#                         The direct db.<ref>.supabase.co host is IPv6-only and is
+#                         unreachable from Railway - use
+#                         postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres
+#   CORS_ORIGINS        - comma-separated frontend origins, e.g. https://<project>.pages.dev
 #   DASHBOARD_PASSWORD  - gates order / kill-switch / automation endpoints
 #   ALPACA_API_KEY      - Alpaca PAPER key id (optional until market data is needed)
 #   ALPACA_API_SECRET   - Alpaca PAPER secret (optional until market data is needed)
 #   REDIS_URL           - optional Redis cache (falls back to in-process cache)
 #   CLAUDE_ENABLED      - optional Muse AI decision support (default false)
 #   CLAUDE_API_KEY      - optional Muse AI key
+#
+# NOTE: secrets are never committed here.
+
+[build]
+  # Pin the Dockerfile builder. Without this Railway defaults to Railpack for new
+  # services, which would try to build this Python repo without the container image.
+  builder = "DOCKERFILE"
+  # Non-standard Dockerfile name: Railway does not auto-detect it, so the path is
+  # mandatory. The file is tracked at the repository root (see Dockerfile.trader).
+  dockerfilePath = "Dockerfile.trader"
+
+[deploy]
+  startCommand = "python scripts/run_trader.py"
+  healthcheckPath = "/api/v2/health"
+  healthcheckTimeout = 60
+  restartPolicyType = "ON_FAILURE"
+  restartPolicyMaxRetries = 10

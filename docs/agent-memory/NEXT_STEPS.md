@@ -32,6 +32,34 @@ Code complete: GitHub CI (`.github/workflows/ci.yml`), Railway config
 (`wrangler.toml` + `scripts/build_frontend.js`), docs (`README.md`,
 `docs/DEPLOYMENT_RAILWAY.md`, `docs/DEPLOYMENT_CLOUDFLARE.md`).
 
+## Railway redeploy unblock (2026-10-26) - code fixed and committed, deploy pending
+Fixed in the repository (not deployed yet):
+`railway.toml` is now schema-valid (`builder = "DOCKERFILE"`,
+`restartPolicyType = "ON_FAILURE"`, invalid `[deploy.environment]` removed);
+`Dockerfile.trader` bakes `REQUIRE_DURABLE_STORE=true` + `PYTHONUNBUFFERED=1`;
+`trader/tests/test_deploy_config.py` guards the config in CI;
+`docs/DEPLOYMENT_RAILWAY.md` documents both failures.
+
+Owner actions, in order:
+1. [ ] Confirm the deployed commit contains `Dockerfile.trader` (`git cat-file -e
+       HEAD:Dockerfile.trader`) - the previous failure was a deployment built from
+       a commit that predates the file.
+2. [ ] Railway service settings -> `Root Directory` must be **empty** (repo root).
+       A subdirectory root reproduces the `code archive` error.
+3. [ ] Railway -> service variables -> set `DATABASE_URL` to the Supabase
+       **Session Pooler** DSN
+       (`postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres`).
+       The direct `db.<ref>.supabase.co` host is IPv6-only and unreachable.
+4. [ ] Confirm the service has `REQUIRE_DURABLE_STORE=true` (now baked into the
+       image; a dashboard value would only override it).
+5. [ ] Deploy once, then check logs for `Trader V2 on http://0.0.0.0:<port>` and
+       `GET /api/v2/health` -> 200 with `components.db.detail = "postgresql"`.
+       Do not loop retries on failure; read the log line first.
+
+Ordering constraint: steps 3 and 4 must be done **before** step 5. The image now
+enforces `REQUIRE_DURABLE_STORE=true`, so an unfixed/incorrect `DATABASE_URL`
+makes the deploy fail (healthcheck never passes) instead of silently degrading.
+
 Manual steps that require the owner (dashboard access / DNS):
 1. [ ] Create the Railway service and add the variables listed in
       `docs/DEPLOYMENT_RAILWAY.md` (`DATABASE_URL`, `CORS_ORIGINS`,

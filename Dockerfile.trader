@@ -16,11 +16,19 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY trader ./trader
 COPY scripts ./scripts
 
-# Paper-only trading enforcement
+# Unbuffered stdout so Railway receives logs/health output immediately.
+ENV PYTHONUNBUFFERED=1
+
+# Paper-only trading enforcement.
+# Railway cannot set environment variables from railway.toml, so these hard
+# safety defaults are baked into the image instead of relying on dashboard state.
 ENV TRADING_MODE=paper
 ENV ENABLE_PAPER_ORDERS=false
 ENV ENABLE_LIVE_TRADING=false
 ENV API_HOST=0.0.0.0
+# Refuse to start unless DATABASE_URL is set AND PostgreSQL is reachable.
+# Without this the service would silently degrade to ephemeral in-memory storage.
+ENV REQUIRE_DURABLE_STORE=true
 # API_PORT is intentionally NOT hardcoded: Railway assigns $PORT dynamically,
 # and config.py reads PORT (after API_PORT, WEB_PORT) as the listen port.
 EXPOSE 8000
