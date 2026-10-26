@@ -163,3 +163,41 @@
     - **Dashboard lock mismatch:** when `DASHBOARD_PASSWORD` is unset the backend
       locks operations, but the UI used to report "unlocked". The UI now keeps
       controls locked and explains how to enable them.
+
+## 2026-10-26 (later) - Broker read starvation + durable-store reporting (fixed)
+
+- **"Paper account unreadable" (`Broker read 'account' exceeded 10.0s`).**
+  Root cause: alpaca-py never passes a `timeout` to `requests.Session.request`
+  (`alpaca/common/rest.py::_one_request`). `Broker._read` bounded the *future*,
+  not the socket, and `Future.cancel()` cannot stop a blocked thread. Four slow
+  calls therefore occupied all four read workers permanently, so every later
+  read timed out even after the network recovered. Each `_c()` call also built a
+  new `TradingClient` (new TLS handshake), which is enough on its own to exceed
+  a 10 s bound on a cold connection.
+  Fixed in `trader/execution/broker.py`: per-request `(connect, read)` timeout
+  injected into the client session (10 s for reads, 30 s for submits - both
+  bounded, submissions longer so an order is not abandoned into ambiguous
+  state); the read pool is retired and replaced after a timeout; the client is
+  memoized per thread (keeps the TLS connection); account verification and
+  order-status reads are bounded by that same socket timeout.
+  Measured locally (paper, read-only): first `account()` 1.9 s, subsequent
+  0.26-0.30 s.
+- **Diagnostics contradiction (`backend=memory`, `durable=false`, `ok=true`).**
+  Root cause: `/api/v2/db` took the `stats()` snapshot *before* `verify()`
+  (which reconnects) and `stats()` derived `backend` from the live handle, so a
+  dropped idle pooler connection was reported as "memory" while the probe said
+  postgres. `get_open_orders()` also invalidated the handle without setting
+  `_degraded`, leaving "not durable but not degraded".
+  Fixed: `stats().backend` now names the *configured* store, with new
+  `connected`/`fallback_memory` fields; `verify()` runs first and the verdict is
+  `ok = schema_ok and durable`; a connection-class read failure marks the store
+  degraded while data/constraint errors keep the pooled connection.
+- **Unsafe execution without durable storage.** `/api/orders` submitted first
+  and persisted afterwards; `Loop.once` swallowed `save_order` failures. Both
+  now refuse/halt *before* submission when `REQUIRE_DURABLE_STORE` is set and
+  `DBStore.durable_available()` fails; a submitted-but-unrecorded order trips
+  the kill switch (API and automation paths both, immediately before each send).
+- **Health semantics.** `/api/v2/health` now returns 503 when the instance is
+  not ready (invalid config, or required durable store unavailable); `/health`
+  and `/healthz` do the same. An engaged kill switch keeps HTTP 200 (body
+  `ok=false`, `status=degraded`) so an orchestrator restart cannot clear it.

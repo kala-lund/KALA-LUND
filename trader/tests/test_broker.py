@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import math
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from trader.execution.broker import Broker, PAPER_HOST, Fill
+from trader.execution.broker import Broker, PAPER_HOST, Fill, _install_request_timeout
 
 
 def test_broker_rejects_live_url():
@@ -159,3 +159,146 @@ def test_broker_rejects_both_qty_and_notional():
         assert False, "both qty and notional must reject"
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Read-path robustness: a hung broker must not make the account permanently
+# unreadable by starving the read pool (regression for
+# "Broker read 'account' exceeded 10.0s" persisting after the network recovers).
+# ---------------------------------------------------------------------------
+def test_read_timeout_releases_the_pool_for_later_reads():
+    calls = {"n": 0}
+
+    class SlowThenFastClient:
+        _base_url = "https://paper-api.alpaca.markets"
+        _sandbox = True
+
+        def get_account(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                time.sleep(1.5)  # simulates a half-open socket
+            return type("A", (), {
+                "equity": "100", "buying_power": "10", "cash": "10",
+                "last_equity": "100", "status": "ACTIVE",
+                "long_market_value": "0"})()
+
+    b = Broker("k", "s", "https://paper-api.alpaca.markets", False,
+               client=SlowThenFastClient(), read_timeout=0.1)
+    t0 = time.perf_counter()
+    try:
+        b.account()
+        assert False, "a hung read must time out"
+    except TimeoutError:
+        pass
+    first = time.perf_counter() - t0
+    acct = b.account()  # must not be queued behind the abandoned worker
+    second = time.perf_counter() - t0 - first
+    assert acct["status"] == "ACTIVE"
+    assert first < 1.0, first
+    assert second < 1.0, second
+    b.close()
+
+
+def test_hung_socket_is_bounded_by_the_installed_timeout():
+    """The injected per-request timeout must fire on a stalled peer."""
+    import socket
+    import threading
+
+    import requests
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def accept_and_stall():
+        try:
+            conn, _ = srv.accept()
+            time.sleep(2.0)  # accept, never answer
+            conn.close()
+        except Exception:  # noqa: BLE001 - test cleanup
+            pass
+
+    threading.Thread(target=accept_and_stall, daemon=True).start()
+
+    class Client:
+        _session = requests.Session()
+
+    _install_request_timeout(Client, 0.3)
+    t0 = time.perf_counter()
+    try:
+        Client._session.request("GET", f"http://127.0.0.1:{port}/v2/account")
+        assert False, "a stalled socket must raise"
+    except requests.exceptions.RequestException:
+        pass
+    assert time.perf_counter() - t0 < 1.5
+    srv.close()
+
+
+def test_send_aborts_without_submitting_when_account_read_times_out():
+    """A broker timeout during verification must fail closed."""
+    import requests
+
+    class TimingOutClient:
+        _base_url = "https://paper-api.alpaca.markets"
+        _sandbox = True
+        submitted = False
+
+        def get_account(self):
+            raise requests.exceptions.ReadTimeout("read timed out")
+
+        def submit_order(self, req):  # pragma: no cover - must not be reached
+            self.submitted = True
+
+    client = TimingOutClient()
+    b = Broker("k", "s", "https://paper-api.alpaca.markets", True, client=client)
+    try:
+        b.send("BTC/USD", "BUY", notional=10)
+        assert False, "a timed-out verification must raise"
+    except Exception:
+        pass
+    assert not client.submitted
+    b.close()
+
+
+def test_client_is_memoized_per_thread(monkeypatch):
+    import alpaca.trading.client as trading
+
+    created = []
+
+    class FakeClient:
+        _base_url = "https://paper-api.alpaca.markets"
+        _sandbox = True
+
+        def __init__(self, *a, **k):
+            created.append(1)
+
+    monkeypatch.setattr(trading, "TradingClient", FakeClient)
+    b = Broker("k", "s", "https://paper-api.alpaca.markets", False)
+    first = b._c()
+    assert b._c() is first  # reuses the client (and its TLS connection)
+    assert len(created) == 1
+    b.close()
+
+
+def test_request_timeout_is_installed_once():
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, **kwargs):
+            self.calls.append(kwargs)
+            return "ok"
+
+    class Client:
+        _session = Session()
+
+    _install_request_timeout(Client, 7.0)
+    _install_request_timeout(Client, 7.0)  # idempotent, never double-wraps
+    assert Client._session.request("GET", "https://paper-api.alpaca.markets/v2/account") == "ok"
+    assert Client._session.request("POST", "https://paper-api.alpaca.markets/v2/orders") == "ok"
+    assert len(Client._session.calls) == 2
+    # Reads are tight; submissions get a longer (still bounded) window so a
+    # slow submit is not abandoned into ambiguous order state prematurely.
+    assert Client._session.calls[0]["timeout"] == (5.0, 7.0)
+    assert Client._session.calls[1]["timeout"] == (5.0, 30.0)

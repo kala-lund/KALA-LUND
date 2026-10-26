@@ -34,6 +34,11 @@
 | 2026-10-26 | Remote PostgreSQL refuses `sslmode=disable/allow/prefer`; managed hosts default to `require` | Pass any operator-supplied sslmode through | TLS is mandatory for Neon/Supabase; fail closed instead of silently sending credentials in plaintext |
 | 2026-10-26 | Cloudflare build pins CSP `connect-src` to `API_BASE_URL`'s origin | Keep `https:` wildcard | The bundle only needs one API origin; narrow CSP limits exfiltration if a dependency or injection appears |
 
+| 2026-10-26 | Readiness = valid config AND (required durable store available); kill switch stays HTTP 200 | Return 503 for any `ok=false`, including `risk_killed` | A restarting orchestrator would otherwise clear the in-memory kill switch. `ok` still reports the kill switch in the body |
+| 2026-10-26 | `stats().backend` names the configured store (`postgres` whenever DATABASE_URL is set); connection state is separate (`connected`/`durable`/`fallback_memory`) | Keep deriving `backend` from the live handle | A dropped idle connection was reported as "memory" even though `require_durable` refuses writes instead of buffering them |
+| 2026-10-26 | Orders are refused (HTTP 503) before submission when the required durable store is unavailable; a submitted-but-unrecorded order trips the kill switch | Submit first, report the persistence error afterwards | An unrecorded live paper order is untracked risk; the execution path must fail closed before the broker is contacted |
+| 2026-10-26 | alpaca-py calls get an injected per-request socket timeout (10 s read / 30 s submit) and a per-thread memoized client | Rely on `Future.result(timeout=...)` only / build a client per call | An abandoned future cannot stop a blocked socket; four hung reads made the account permanently unreadable. Reusing the client keeps TLS warm (1.9 s -> 0.27 s) |
+
 ## Open questions (need user confirmation)
 
 - Alpaca paper API keys not yet provided → live market/pipeline runs untested (mock/quality paths tested).

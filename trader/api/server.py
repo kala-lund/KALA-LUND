@@ -253,14 +253,17 @@ def create_app():
         stats = db.stats()
         if not stats.get("configured"):
             if s.require_durable_store:
-                return {"ok": False, "detail": "durable store required but no DATABASE_URL"}
-            return {"ok": True, "detail": "memory (no DATABASE_URL configured)"}
-        probe = _cached_health("db_probe", db.health_check)
-        if probe.get("status") == "ok":
-            return {"ok": True, "detail": "postgres",
-                    "latency_ms": probe.get("latency_ms")}
+                return {"ok": False, "detail": "durable store required but no DATABASE_URL",
+                        "configured": False, "backend": "none", "durable": False}
+            return {"ok": True, "detail": "memory (no DATABASE_URL configured)",
+                    "configured": False, "backend": "memory", "durable": False}
+        store = _cached_health("db_probe", db.durable_available)
+        if store.get("ok"):
+            return {"ok": True, "detail": "postgres", "backend": "postgres",
+                    "durable": True, "latency_ms": store.get("latency_ms")}
         return {"ok": not s.require_durable_store,
-                "detail": f"postgres unavailable: {probe.get('error') or 'probe failed'}"}
+                "detail": "postgres unavailable",
+                "backend": "postgres", "durable": False}
 
     def _redis_component() -> dict:
         stats = _cached_health("cache_stats", lambda: cache.stats())
@@ -284,7 +287,15 @@ def create_app():
         if include_extras:
             comps["Muse"] = {"ok": True, "detail": "enabled" if ai.available else "disabled/fail-closed"}
             comps["rl"] = {"ok": True, "detail": _SB3_VERSION}
+        # "ready" is the deployment gate (can this instance safely take traffic?):
+        # valid config plus a working durable store when one is required.
+        # "ok" additionally covers state that must not trigger a restart, such as
+        # an engaged kill switch (a restart would clear it).
+        storage_ready = dbf["ok"] if s.require_durable_store else True
+        ready = (not errs) and storage_ready
+        healthy = ready and not risk.killed and not errs
         return {"ok": (not errs) and (not risk.killed) and dbf["ok"],
+                "ready": ready, "status": "ok" if healthy else "degraded",
                 "mode": s.trading_mode, "components": comps,
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
@@ -407,6 +418,18 @@ def create_app():
     @app.post("/api/orders")
     def orders(request: Request, req: OrderReq):
         authed(req.password, "orders", request)
+        if s.require_durable_store:
+            # Fail closed BEFORE the broker is contacted. Submitting first and
+            # discovering the order cannot be recorded leaves a live paper order
+            # with no durable trace of it.
+            store = db.durable_available()
+            if not store.get("ok"):
+                log("order_refused_storage", level="error", symbol=req.symbol,
+                    error=store.get("detail"))
+                return JSONResponse(status_code=503, content={
+                    "approved": False,
+                    "reasons": ["Durable store unavailable; order refused before submission."],
+                    "durable_store": {"ok": False, "detail": store.get("detail")}})
         try:
             sym, notional = v_sym(req.symbol), v_qty(req.notional)
             acct = live_acct()
@@ -430,6 +453,10 @@ def create_app():
                     return None
                 except Exception as exc:  # noqa: BLE001 - report, don't mask the order
                     msg = safe_msg(exc)
+                    # The order was already submitted: without a durable record it
+                    # is untracked risk, so halt further submissions (same rule as
+                    # the automation loop).
+                    risk.trip("Order could not be recorded; reconciliation required.")
                     log("order_persist_failed", level="error", symbol=sym,
                         cid=f.cid, status=f.status, error=msg)
                     return msg
@@ -515,17 +542,22 @@ def create_app():
     # ===== V2 API (versioned, minimal) ============
     @app.get("/api/v2/health")
     def api_health():
-        # Liveness for the platform router (Railway healthcheck): always HTTP 200
-        # once the process is up; the body's "ok" reflects real dependency state.
-        return _health_payload(include_extras=True)
+        # Readiness for the platform router (Railway healthcheck). Returns 503
+        # when this instance cannot safely take traffic: invalid config, or
+        # REQUIRE_DURABLE_STORE with an unreachable durable store.
+        body = _health_payload(include_extras=True)
+        return JSONResponse(status_code=200 if body["ready"] else 503, content=body)
 
     @app.get("/health")
     @app.get("/healthz")
     def health_readiness():
-        # Readiness for external monitors/uptime checks: HTTP 503 when degraded,
-        # 200 when healthy. Same body as /api/v2/health.
+        # Readiness for external monitors/uptime checks: HTTP 503 when this
+        # instance cannot safely serve traffic (durable store required but
+        # unavailable, or invalid config), 200 otherwise. Same body as
+        # /api/v2/health. An engaged kill switch is reported as ok=false but
+        # stays HTTP 200 on purpose: a restarting orchestrator would clear it.
         body = _health_payload(include_extras=True)
-        return JSONResponse(status_code=200 if body["ok"] else 503, content=body)
+        return JSONResponse(status_code=200 if body["ready"] else 503, content=body)
 
     @app.get("/api/v2/market")
     def api_market():
@@ -690,22 +722,36 @@ def create_app():
     def api_db_v2():
         """Sanitized durable-store verification (schema, indexes, row counts)."""
         def _fetch():
-            stats = db.stats()
             report: dict = {"configured": bool(s.database_url),
-                            "backend": stats.get("backend"),
-                            "degraded": stats.get("degraded"),
-                            "durable": bool(stats.get("durable")),
-                            "require_durable": s.require_durable_store,
-                            "error": stats.get("error")}
+                            "require_durable": s.require_durable_store}
             if not s.database_url:
-                report["ok"] = not s.require_durable_store
-                report["detail"] = "no DATABASE_URL configured"
+                report.update({"ok": not s.require_durable_store, "backend": "memory",
+                               "connected": False, "durable": False, "degraded": False,
+                               "fallback_memory": True, "error": None,
+                               "detail": "no DATABASE_URL configured"})
                 return report
             try:
+                # Probe/verify BEFORE taking the status snapshot: verify()
+                # reconnects once, so schema results and backend/durable fields
+                # then describe the same moment instead of contradicting.
                 report.update(db.verify())
             except Exception as exc:  # noqa: BLE001 - never leak a DSN
                 report["ok"] = False
                 report["error"] = safe_msg(exc)
+            stats = db.stats()
+            report.update({
+                "backend": stats.get("backend"),
+                "connected": bool(stats.get("connected")),
+                "durable": bool(stats.get("durable")),
+                "degraded": bool(stats.get("degraded")),
+                "fallback_memory": bool(stats.get("fallback_memory")),
+            })
+            if not report.get("error"):
+                report["error"] = stats.get("error")
+            # A single coherent verdict: the schema is valid AND writes are
+            # actually persisted durably right now.
+            report["ok"] = bool(report.get("ok")) and bool(report["durable"])
+            report["ready"] = report["ok"]
             return report
         return _cached_health("db_verify", _fetch)
 

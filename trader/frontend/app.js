@@ -1203,9 +1203,12 @@
       </section>
       <section class="grid two">
         <div class="card">
-          <div class="card-head"><h2>Durable store</h2><span class="pill ${d && d.ok ? "ok" : "bad"}">${d && d.ok ? "verified" : "not verified"}</span></div>
+          <div class="card-head"><h2>Durable store</h2><span class="pill ${d && d.ok ? "ok" : "bad"}">${d && d.ok ? "verified" : (d && d.require_durable ? "required · unavailable" : "not verified")}</span></div>
           ${d ? `
             <div class="kv"><span class="k">Backend</span><span class="v">${esc(d.backend || "—")}</span></div>
+            <div class="kv"><span class="k">Connection</span><span class="v">${d.connected ? "connected" : (d.configured ? "disconnected" : "not configured")}</span></div>
+            <div class="kv"><span class="k">Durable writes</span><span class="v">${d.durable ? "yes" : "no"}</span></div>
+            <div class="kv"><span class="k">Write path</span><span class="v">${d.fallback_memory ? "in-memory fallback" : "PostgreSQL only"}</span></div>
             <div class="kv"><span class="k">Configured</span><span class="v">${d.configured ? "yes" : "no"}</span></div>
             <div class="kv"><span class="k">Schema version</span><span class="v">${esc(d.schema_version ?? "—")} / ${esc(d.expected_version ?? "—")}</span></div>
             <div class="kv"><span class="k">Signals</span><span class="v">${d.counts ? num(d.counts.signals, 0) : "—"}</span></div>

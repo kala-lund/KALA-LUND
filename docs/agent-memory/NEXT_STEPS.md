@@ -106,3 +106,15 @@ Owner actions, in order (all require explicit approval; none were executed):
 6. [ ] Only after a successful deploy: consider a Neon restore-point/branch
        backup and a Railway Infrastructure-as-Code migration (config-as-code is
        deprecated 2026-12-01).
+
+7. [ ] Confirm on Railway: `/api/v2/health` returns 503 (not 200) while the Neon
+       branch is unreachable, and 200 after recovery; `/api/v2/db` must never
+       report a `backend` other than `postgres` when `DATABASE_URL` is set.
+8. [ ] After deploy, verify an order attempt with the database paused returns 503
+       `approved=false` and never reaches Alpaca (check the `order_refused_storage`
+       log entry).
+9. [ ] Consider a bounded retry (one attempt) for the first cold `/v2/account`
+       read if Railway cold starts still exceed the 10 s bound.
+10. [ ] Decide whether `restartPolicyType` should stay `ON_FAILURE` now that a
+        degraded durable store makes `/api/v2/health` return 503 (an orchestrator
+        may restart the instance; the kill switch lives in memory).

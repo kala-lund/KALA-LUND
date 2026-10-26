@@ -10,6 +10,10 @@ import pytest
 from trader.data.db_store import DBStore
 
 
+class OperationalError(Exception):
+    """Named exactly like psycopg2's connection error (classified by name)."""
+
+
 def _make_conn_mock(execute_side=None):
     conn = MagicMock()
     conn.autocommit = True
@@ -241,4 +245,102 @@ def test_db_store_save_order_postgres_path(mock_connect):
     db.save_order("BTC/USD", "BUY", 100.0, "filled", "abc123")
     cur = conn.cursor.return_value
     cur.execute.assert_called()
+    db.close()
+
+
+@patch("psycopg2.connect")
+def test_stats_names_configured_backend_even_when_disconnected(mock_connect):
+    """A dropped handle must never be reported as an in-memory store.
+
+    Regression: diagnostics returned ``backend=memory, durable=false`` while the
+    health probe (which reconnects) reported postgres.
+    """
+    mock_connect.return_value = _make_conn_mock()
+    db = DBStore(database_url="postgresql://user:pass@host:5432/db",
+                 require_durable=True)
+    db._invalidate_conn()
+
+    stats = db.stats()
+    assert stats["backend"] == "postgres"
+    assert stats["configured"] is True
+    assert stats["connected"] is False
+    assert stats["durable"] is False
+    assert stats["degraded"] is True
+    # require_durable never buffers writes in memory, so no fallback is active.
+    assert stats["fallback_memory"] is False
+    db.close()
+
+
+@patch("psycopg2.connect")
+def test_durable_available_probes_and_recovers(mock_connect):
+    """The trading gate actively reconnects instead of trusting a dead handle."""
+    mock_connect.return_value = _make_conn_mock()
+    db = DBStore(database_url="postgresql://user:pass@host:5432/db")
+    db._invalidate_conn()
+    verdict = db.durable_available()
+    assert verdict["ok"] is True
+    assert verdict["backend"] == "postgres"
+    assert "secretpass" not in str(verdict)
+    db.close()
+
+
+@patch("psycopg2.connect")
+def test_durable_available_reports_failure_without_leaking_dsn(mock_connect):
+    def execute_side(sql, *args):
+        if "SELECT 1" in str(sql):
+            raise Exception("could not connect to postgresql://user:secretpass@host/db")
+        return None
+
+    mock_connect.return_value = _make_conn_mock(execute_side=execute_side)
+    db = DBStore(database_url="postgresql://user:secretpass@host:5432/db")
+    verdict = db.durable_available()
+    assert verdict["ok"] is False
+    assert verdict["backend"] == "postgres"
+    assert "secretpass" not in str(verdict)
+    db.close()
+
+
+def test_durable_available_is_false_when_required_but_unconfigured():
+    db = DBStore(database_url="")
+    db.require_durable = True
+    verdict = db.durable_available()
+    assert verdict["ok"] is False
+    assert verdict["backend"] == "none"
+
+
+@patch("psycopg2.connect")
+def test_get_open_orders_failure_marks_store_degraded(mock_connect):
+    """A connection-class read failure must not leave a 'healthy' status."""
+    def execute_side(sql, *args):
+        if "FROM orders" in str(sql):
+            raise OperationalError("server closed the connection unexpectedly")
+        return None
+
+    mock_connect.return_value = _make_conn_mock(execute_side=execute_side)
+    db = DBStore(database_url="postgresql://user:pass@host:5432/db")
+    orders, err = db.get_open_orders()
+    assert orders == []
+    assert err == "db open-orders query failed"
+    stats = db.stats()
+    assert stats["degraded"] is True
+    assert stats["durable"] is False
+    assert stats["backend"] == "postgres"
+    db.close()
+
+
+@patch("psycopg2.connect")
+def test_get_open_orders_data_error_keeps_connection(mock_connect):
+    """A data/constraint error is not a storage outage: keep the connection."""
+    def execute_side(sql, *args):
+        if "FROM orders" in str(sql):
+            raise ValueError("operator does not exist: text = integer")
+        return None
+
+    mock_connect.return_value = _make_conn_mock(execute_side=execute_side)
+    db = DBStore(database_url="postgresql://user:pass@host:5432/db")
+    orders, err = db.get_open_orders()
+    assert orders == [] and err
+    stats = db.stats()
+    assert stats["connected"] is True
+    assert stats["degraded"] is False
     db.close()

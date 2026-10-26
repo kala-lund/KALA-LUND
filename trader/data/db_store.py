@@ -456,20 +456,55 @@ class DBStore:
 
     # ---- reads ------------------------------------------------------------
     def stats(self) -> dict:
-        """Cheap, query-free status. ``signals``/``backtests``/``orders`` are
-        record counts buffered **in memory only** (they are not database row
-        counts; see :meth:`row_counts`)."""
+        """Cheap, query-free status snapshot.
+
+        ``backend`` names the **configured** store: ``postgres`` whenever a
+        DATABASE_URL is set. It is deliberately not derived from the current
+        connection handle, because a transient disconnect is not a switch to
+        in-memory storage -- with ``require_durable`` the store refuses writes
+        instead of buffering them. What would happen to a write *right now* is
+        reported separately by ``connected``/``durable``/``fallback_memory``.
+
+        ``signals``/``backtests``/``orders`` are record counts buffered **in
+        memory only** (they are not database row counts; see
+        :meth:`row_counts`).
+        """
         with self._lock:
+            configured = bool(self.url)
+            connected = self._conn is not None
             return {
-                "backend": "postgres" if self._conn is not None else "memory",
-                "configured": bool(self.url),
-                "durable": self._conn is not None and not self._degraded,
-                "degraded": bool(self._degraded),
+                "backend": "postgres" if configured else "memory",
+                "configured": configured,
+                "connected": connected,
+                "durable": connected and not self._degraded,
+                "degraded": bool(self._degraded) or (configured and not connected),
+                "fallback_memory": (not configured) or (
+                    configured and not self.require_durable and not connected),
                 "error": self._err,
                 "signals": len(self._mem_signals),
                 "backtests": len(self._mem_backtests),
                 "orders": len(self._mem_orders),
             }
+
+    def durable_available(self) -> dict:
+        """Whether a write would be persisted durably right now.
+
+        Actively probes (one bounded reconnect + ``SELECT 1``) so callers that
+        gate trading on durable storage never trust a stale handle. Returns a
+        sanitized verdict; never raises and never includes credentials.
+        """
+        if not self.url:
+            if self.require_durable:
+                return {"ok": False, "backend": "none",
+                        "detail": "DATABASE_URL is not configured"}
+            return {"ok": True, "backend": "memory",
+                    "detail": "memory (no DATABASE_URL configured)"}
+        probe = self.health_check()
+        if probe.get("status") == "ok":
+            return {"ok": True, "backend": "postgres", "detail": "postgres",
+                    "latency_ms": probe.get("latency_ms")}
+        return {"ok": False, "backend": "postgres",
+                "detail": probe.get("error") or "postgres unavailable"}
 
     def row_counts(self) -> dict[str, int]:
         """Return exact row counts for the durable tables.
@@ -616,6 +651,12 @@ class DBStore:
                 for r in rows
             ]
             return out, None
-        except Exception:  # noqa: BLE001
-            self._invalidate_conn()
+        except Exception as exc:  # noqa: BLE001
+            # A connection-class failure invalidates the handle and marks the
+            # store degraded; a data/constraint error leaves a healthy pooled
+            # connection alone (same classification as _write).
+            self._err = safe_msg(exc)
+            if _is_connection_error(exc):
+                self._degraded = True
+                self._invalidate_conn()
             return [], "db open-orders query failed"

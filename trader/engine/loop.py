@@ -227,9 +227,30 @@ class Loop:
         """Return whether this loop may call a broker submission method."""
         return not self.st.dry_run and bool(getattr(self.s, "enable_paper_orders", False))
 
+    def _durable_blocked(self, results: list | None = None) -> dict | None:
+        """Return a halt result when the required durable store is unavailable.
+
+        Called immediately before every submission (not just once per cycle): the
+        pipeline performs network work, so the store can fail mid-cycle.
+        """
+        if self.db is None or not getattr(self.s, "require_durable_store", False):
+            return None
+        store = self.db.durable_available()
+        if store.get("ok"):
+            return None
+        log("auto_halted_storage", level="error", error=store.get("detail"))
+        out: dict = {"action": "halted",
+                     "reason": "Durable store unavailable; no orders were submitted."}
+        if results:
+            out["results_so_far"] = results
+        return self._done("halted: durable store unavailable", out)
+
     def once(self) -> dict:
         if self.risk.killed:
             return self._done("halted: kill switch", {"action": "halted", "reason": "Kill switch engaged."})
+        blocked = self._durable_blocked()
+        if blocked is not None:
+            return blocked
         try:
             pipe = self.cycle_fn()
         except Exception as exc:  # noqa: BLE001
@@ -272,6 +293,9 @@ class Loop:
             if self._throttled():
                 results.append({"symbol": sym, "skipped": "submit throttle"})
                 continue
+            blocked = self._durable_blocked(results)
+            if blocked is not None:
+                return blocked
             try:
                 res = self.broker.send(sym, act, notional=notional, cid=cid)
             except Exception as exc:  # noqa: BLE001 - submission outcome is uncertain
@@ -280,8 +304,12 @@ class Loop:
                 if self.db is not None:
                     try:
                         self.db.save_order(sym, act, float(notional), "unknown", cid)
-                    except Exception:  # noqa: BLE001 - persistence failure cannot change fail-closed state
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - fail closed, never crash the loop
+                        # The order may exist at the broker and can no longer be
+                        # recorded: halt further submissions until reconciled.
+                        self.risk.trip("Order outcome unrecorded; reconciliation required.")
+                        log("auto_persist_failed", level="error", symbol=sym,
+                            cid=cid, status="unknown", error=safe_msg(exc))
                 self.st.live_orders += 1
                 results.append({"symbol": sym, "status": "unknown", "client_order_id": cid,
                                 "reconcile_required": True})
@@ -290,8 +318,12 @@ class Loop:
             if self.db is not None:
                 try:
                     self.db.save_order(sym, act, float(notional), res.status, res.cid or "")
-                except Exception:  # noqa: BLE001 - never crash the loop over persistence
-                    pass
+                except Exception as exc:  # noqa: BLE001 - fail closed, never crash the loop
+                    # A submitted order that cannot be recorded is untracked risk:
+                    # halt new submissions instead of continuing to trade.
+                    self.risk.trip("Order could not be recorded; reconciliation required.")
+                    log("auto_persist_failed", level="error", symbol=sym,
+                        cid=res.cid, status=res.status, error=safe_msg(exc))
             if res.status not in ("filled", "partially_filled", "submitted", "accepted",
                                   "new", "pending_new", "held"):
                 # submit failure or uncertain fill: reconcile, never assume fill
@@ -364,6 +396,10 @@ class Loop:
                                 send_kwargs["qty"] = qty
                             else:
                                 send_kwargs["notional"] = notional
+                            blocked = self._durable_blocked(results)
+                            if blocked is not None:
+                                self._pending_take_profit.discard(sym)
+                                return blocked
                             try:
                                 res = self.broker.send(sym, exit_side, **send_kwargs)
                             except Exception as exc:  # noqa: BLE001 - exit outcome is uncertain
@@ -372,8 +408,10 @@ class Loop:
                                 if self.db is not None:
                                     try:
                                         self.db.save_order(sym, exit_side, float(notional), "unknown", cid)
-                                    except Exception:  # noqa: BLE001
-                                        pass
+                                    except Exception as exc:  # noqa: BLE001
+                                        self.risk.trip("Exit order outcome unrecorded; reconciliation required.")
+                                        log("auto_persist_failed", level="error", symbol=sym,
+                                            cid=cid, status="unknown", error=safe_msg(exc))
                                 self.st.live_orders += 1
                                 results.append({"symbol": sym, "status": "unknown", "client_order_id": cid,
                                                 "reconcile_required": True, "reason": "take_profit"})
@@ -384,8 +422,10 @@ class Loop:
                                 try:
                                     self.db.save_order(sym, exit_side, float(notional),
                                                        res.status, res.cid or "")
-                                except Exception:
-                                    pass
+                                except Exception as exc:  # noqa: BLE001
+                                    self.risk.trip("Exit order could not be recorded; reconciliation required.")
+                                    log("auto_persist_failed", level="error", symbol=sym,
+                                        cid=res.cid, status=res.status, error=safe_msg(exc))
                             if res.status not in ("filled", "partially_filled",
                                                   "submitted", "accepted",
                                                   "new", "pending_new", "held"):

@@ -5,7 +5,12 @@ from __future__ import annotations
 import time
 import uuid
 import math
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+import threading
+from concurrent.futures import (
+    CancelledError,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeout,
+)
 from dataclasses import dataclass
 
 from ..data.market import canon
@@ -23,6 +28,53 @@ PAPER_URL = PAPER_TRADING_ENDPOINT
 def _utc_iso() -> str:
     """UTC timestamp with second precision (used for in-process fill records)."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _install_request_timeout(client: object, timeout: float) -> None:
+    """Bound every HTTP call made by an alpaca-py client.
+
+    ``alpaca/common/rest.py`` calls ``self._session.request(method, url, **opts)``
+    without a ``timeout``, so a half-open connection can block a worker thread
+    forever. A ``Future.result(timeout=...)`` cannot cancel that thread; after a
+    few such calls the read pool is permanently starved. Injecting a per-request
+    ``(connect, read)`` timeout makes the socket itself give up.
+
+    Read-only verbs use ``timeout``; order submission (POST/DELETE/PATCH) gets a
+    longer bound because abandoning a submit creates ambiguous order state. Both
+    stay bounded -- an unbounded submit would hang the request thread forever.
+    """
+    session = getattr(client, "_session", None)
+    if session is None or not callable(getattr(session, "request", None)):
+        return
+    if getattr(session, "_finrl_timeout_installed", False):
+        return
+    original = session.request
+    connect = min(5.0, max(1.0, float(timeout)))
+    read = max(1.0, float(timeout))
+    submit_read = max(30.0, read)
+
+    def request(method, url, **kwargs):
+        verb = str(method).upper()
+        kwargs.setdefault("timeout", (connect, read if verb in ("GET", "HEAD") else submit_read))
+        return original(method, url, **kwargs)
+
+    session.request = request
+    session._finrl_timeout_installed = True
+
+
+def _shutdown_pool(pool: ThreadPoolExecutor) -> None:
+    """Shut a pool down without waiting (``cancel_futures`` needs Python 3.9+)."""
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+        return
+    except TypeError:  # pragma: no cover - Python 3.7/3.8
+        pass
+    except Exception:  # noqa: BLE001 - best-effort cleanup
+        return
+    try:  # pragma: no cover - Python 3.7/3.8
+        pool.shutdown(wait=False)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @dataclass
@@ -55,19 +107,45 @@ class Broker:
         # Hard upper bound for READ-ONLY broker calls (see _read).
         self._read_timeout = max(0.1, float(read_timeout))
         self._read_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="broker-read")
+        # One memoized alpaca-py client per calling thread: reusing the client
+        # keeps the TLS connection alive (a cold handshake alone can exceed the
+        # read bound) without sharing a requests.Session across threads.
+        self._local = threading.local()
+        self._pool_lock = threading.Lock()
 
     def close(self) -> None:
         """Release the read-only worker pool (idempotent)."""
-        try:
-            self._read_pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:  # noqa: BLE001 - best-effort shutdown
-            pass
+        with self._pool_lock:
+            # Replace before shutting down so a late read gets a usable pool
+            # instead of "cannot schedule new futures after shutdown".
+            old, self._read_pool = self._read_pool, ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="broker-read")
+        _shutdown_pool(old)
+
+    def _reset_read_pool(self) -> None:
+        """Replace a read pool whose worker cannot be interrupted.
+
+        ``Future.cancel()`` cannot stop a thread already blocked in a socket
+        call, so a timed-out read is abandoned and the pool is replaced. Without
+        this, four slow calls would make every later read time out even after
+        the network recovers.
+        """
+        with self._pool_lock:
+            old, self._read_pool = self._read_pool, ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="broker-read")
+        _shutdown_pool(old)
 
     def _c(self):
         if self._client is not None:
             return self._client
+        cached = getattr(self._local, "client", None)
+        if cached is not None:
+            return cached
         from alpaca.trading.client import TradingClient
-        return TradingClient(self._key, self._secret, paper=True, url_override=self.url)
+        client = TradingClient(self._key, self._secret, paper=True, url_override=self.url)
+        _install_request_timeout(client, self._read_timeout)
+        self._local.client = client
+        return client
 
     def _read(self, label: str, fn):
         """Run a READ-ONLY broker call with a bounded latency.
@@ -81,15 +159,39 @@ class Broker:
 
         Order submission is deliberately NOT wrapped this way: a timeout there
         would create ambiguous order state, which the execution path handles
-        explicitly (status ``unknown`` -> kill switch).
+        explicitly (status ``unknown`` -> kill switch). Submission is bounded by
+        the per-request socket timeout instead (see _install_request_timeout).
         """
-        fut = self._read_pool.submit(fn)
-        try:
-            return fut.result(timeout=self._read_timeout)
-        except FuturesTimeout as exc:
-            raise TimeoutError(
-                f"Broker read '{label}' exceeded {self._read_timeout:.1f}s"
-            ) from exc
+        deadline = time.perf_counter() + self._read_timeout
+        for _attempt in (1, 2):
+            with self._pool_lock:
+                pool = self._read_pool
+                try:
+                    fut = pool.submit(fn)
+                except RuntimeError:
+                    # A concurrent close/reset retired this pool; retry on the
+                    # replacement instead of failing the caller.
+                    fut = None
+            if fut is None:
+                continue
+            try:
+                return fut.result(timeout=max(0.0, deadline - time.perf_counter()))
+            except FuturesTimeout as exc:
+                if fut.done():
+                    # The callable itself raised TimeoutError (3.11+ aliases
+                    # concurrent.futures.TimeoutError); the pool is healthy.
+                    raise
+                fut.cancel()
+                # The worker is likely still blocked in the socket; retire the
+                # pool so later reads are not queued behind a dead thread.
+                self._reset_read_pool()
+                raise TimeoutError(
+                    f"Broker read '{label}' exceeded {self._read_timeout:.1f}s"
+                ) from exc
+            except CancelledError:
+                # Cancelled by a concurrent pool reset before it started.
+                continue
+        raise TimeoutError(f"Broker read '{label}' could not be scheduled")
 
     def account(self) -> dict:
         a = self._read("account", lambda: self._c().get_account())
@@ -160,6 +262,9 @@ class Broker:
                 raise ValueError("limit must be numeric for limit orders.") from exc
             if not math.isfinite(order_limit) or order_limit <= 0:
                 raise ValueError("limit must be positive and finite.")
+        # The socket timeout installed by _install_request_timeout bounds this
+        # account read, so a hung broker cannot block the request thread. One
+        # client is used for verification and submission (same TLS session).
         c = self._c()
         verify_paper_order_submission(c, self._key, self._secret, self.url, self._broker_environment)
         cid = cid or f"tr-{uuid.uuid4().hex[:12]}"
@@ -202,9 +307,8 @@ class Broker:
         try:
             from alpaca.trading.enums import QueryOrderStatus
             from alpaca.trading.requests import GetOrdersRequest
-            c = self._c()
             req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-            orders = c.get_orders(req)
+            orders = self._read("open_orders", lambda: self._c().get_orders(req))
             out = []
             for o in orders:
                 out.append({

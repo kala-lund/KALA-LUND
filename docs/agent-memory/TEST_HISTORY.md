@@ -583,3 +583,34 @@ Review-driven fixes applied after the first green run (all covered by the 156-pa
 Authorization Required`. The test file hardcodes `API_KEY = "???"` and
 `API_SECRET = "???"` and performs live network calls. It is unmodified and was
 already failing before the Neon/dashboard work (baseline run also failed).
+
+## 2026-10-26 - Broker availability + durable-store gate (executed evidence)
+
+Environment: Windows, `.venv` Python, local `.env` (Neon pooled DSN, paper
+Alpaca keys). Read-only probes only: no orders submitted, no live trading, no
+commit/push/deploy, no production variables changed.
+
+| # | Command / probe | Result |
+|---|---|---|
+| 1 | `python -m compileall -q trader scripts/db_migrate.py` | PASS (exit 0) |
+| 2 | `node --check trader/frontend/app.js` | PASS (exit 0) |
+| 3 | `pytest trader/tests/test_broker.py trader/tests/test_db_store.py trader/tests/test_engine.py trader/tests/test_api_dashboard.py -q` | **62 passed** (38.7 s) |
+| 4 | `pytest trader/tests -q` | **176 passed, 2 skipped** (38.0 s) |
+| 5 | `pytest unit_tests -q` | 78 passed, 1 skipped, 3 xfailed, **2 failed** (pre-existing `test_alpaca_downloader` 401; unchanged file) |
+| 6 | Live paper broker read (`GET /v2/account`, credentials from `.env`, no order calls) | HTTP 200, `status=ACTIVE`; `Broker.account()` first call 1.92 s, then 0.26-0.28 s (was: first call exceeded the 10 s bound and starved the read pool) |
+| 7 | Live `/api/v2/db` after forcing `_invalidate_conn()` (simulated idle pooler drop, real Neon) | `ok=true, backend=postgres, durable=true, degraded=false` - previously `ok=true, backend=memory, durable=false` |
+| 8 | Live `/api/v2/health` + `/health`, real Neon | 200, `components.db = {ok:true, backend:postgres, durable:true, latency_ms:~310-325}` |
+| 9 | Startup with `REQUIRE_DURABLE_STORE=true` and an unreachable DSN (`192.0.2.1`, overridden in-process) | `RuntimeError: ... refusing to fall back to ephemeral in-memory storage`; sanitized message contains no credentials |
+
+New regression tests: broker read-pool recovery after a hung call, socket-level
+request-timeout enforcement, fail-closed send when verification times out,
+per-thread client memoization, request-timeout installation (read vs submit),
+`stats()` backend semantics, `durable_available()` probe/failure redaction,
+degraded-on-connection-error vs data-error, 503 readiness on both health
+endpoints, kill-switch-stays-200, coherent `/api/v2/db` payload, verify-before-
+stats ordering, pre-submission order refusal, persistence-failure kill switch,
+and loop halt/trip behaviour.
+
+Not verified: behaviour against an actually-down Neon branch (the 503 path is
+proven by unit tests with a stubbed store, and by the startup-refusal probe
+above, not by breaking production connectivity).

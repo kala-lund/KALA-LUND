@@ -99,3 +99,52 @@ def test_concurrent_store():
     ms = MarketStore(P(), Cache(10, 60), workers=4)  # type: ignore[arg-type]
     r = ms.many(["A/USD", "B/USD"], "15Min", limit=5)
     assert len(r) == 2 and all(isinstance(v, list) for v in r.values())
+
+
+# ---------------------------------------------------------------------------
+# Durable-store gate for automated execution.
+# ---------------------------------------------------------------------------
+class _DurableStore:
+    def __init__(self, ok=True, fail_write=False):
+        self.ok, self.fail_write, self.saved = ok, fail_write, []
+
+    def durable_available(self):
+        return {"ok": self.ok, "backend": "postgres",
+                "detail": "postgres" if self.ok else "connection refused"}
+
+    def save_order(self, *args):
+        if self.fail_write:
+            raise RuntimeError("durable store write failed")
+        self.saved.append(args)
+
+
+def test_loop_halts_before_submitting_without_durable_store():
+    """No order may reach the broker when durable persistence is unavailable."""
+    fb = FakeBroker()
+    store = _DurableStore(ok=False)
+    lo = Loop(_s(automate_dry_run=False, enable_paper_orders=True,
+                 require_durable_store=True),
+              lambda: _pipe(), Risk(Limits()), fb, lambda: _acct(), db=store)
+    out = lo.once()
+    assert out["action"] == "halted"
+    assert "durable" in out["reason"].lower()
+    assert fb.sent == []
+    assert store.saved == []
+
+
+def test_loop_trips_kill_switch_when_a_submitted_order_cannot_be_recorded():
+    from trader.execution.broker import Fill
+
+    class _B(FakeBroker):
+        def send(self, sym, side, **kw):
+            self.sent.append((sym, side))
+            return Fill(cid="c1", status="filled", symbol=sym, side=side,
+                        qty=None, filled_qty=1.0, filled_price=100.0)
+
+    store = _DurableStore(ok=True, fail_write=True)
+    risk = Risk(Limits())
+    lo = Loop(_s(automate_dry_run=False, enable_paper_orders=True,
+                 require_durable_store=True),
+              lambda: _pipe(), risk, _B(), lambda: _acct(), db=store)
+    lo.once()
+    assert risk.killed is True
