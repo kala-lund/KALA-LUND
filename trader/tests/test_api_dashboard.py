@@ -52,6 +52,33 @@ def test_positions_reports_unavailable_instead_of_empty_book(monkeypatch):
     assert body["total_unrealized_pl"] is None
 
 
+def test_flat_book_and_unavailable_book_are_distinguishable(monkeypatch):
+    """A genuinely flat account is not the same payload as a failed broker read."""
+    from trader.api.server import Broker
+
+    monkeypatch.setattr(Broker, "account", lambda self: {
+        "equity": 10000.0, "bp": 10000.0, "day_pnl": 0.0, "cash": 10000.0,
+        "status": "ACTIVE"})
+    monkeypatch.setattr(Broker, "positions_detail", lambda self: [])
+    flat = _client().get("/api/v2/positions").json()
+    assert flat["available"] is True
+    assert flat["positions"] == []
+    assert flat["total_unrealized_pl"] == 0.0
+    assert flat["positions_value"] == 0.0
+    assert flat["error"] is None
+
+    def boom(self, *a, **k):
+        raise RuntimeError("broker offline")
+
+    monkeypatch.setattr(Broker, "account", boom)
+    down = _client().get("/api/v2/positions").json()
+    assert down["available"] is False
+    assert down["positions"] == []
+    assert down["total_unrealized_pl"] is None
+    assert down["positions_value"] is None
+    assert down["error"]
+
+
 def test_quotes_report_per_symbol_unavailable(monkeypatch):
     def boom(self, *a, **k):
         raise RuntimeError("market data offline")
@@ -202,6 +229,7 @@ def _durable_client(monkeypatch, ok: bool, password: str = "") -> TestClient:
     monkeypatch.setattr(DBStore, "_init_db", lambda self: None)
     monkeypatch.setattr(DBStore, "durable_available", lambda self: {
         "ok": ok, "backend": "postgres",
+        "latency_ms": 1.5 if ok else None,
         "detail": "postgres" if ok else "connection refused"})
     monkeypatch.setattr(DBStore, "health_check", lambda self: {
         "status": "ok" if ok else "error",
@@ -239,9 +267,16 @@ def test_health_is_200_when_required_durable_store_is_available(monkeypatch):
         assert r.status_code == 200, path
         body = r.json()
         assert body["ready"] is True
-        assert body["status"] == "ok"
+        assert body["storage"]["durable"] is True
+        assert body["storage"]["required"] is True
         assert body["components"]["db"]["backend"] == "postgres"
         assert body["components"]["db"]["durable"] is True
+        assert body["components"]["db"]["latency_ms"] == 1.5
+        # This hermetic environment has no Alpaca credentials, so overall health
+        # is correctly degraded while readiness stays true (no 503 / no restart).
+        assert body["components"]["broker"]["status"] == "missing_credentials"
+        assert body["ok"] is False
+        assert body["status"] == "degraded"
 
 
 def test_db_diagnostics_never_contradict_the_health_probe(monkeypatch):

@@ -118,3 +118,20 @@ Owner actions, in order (all require explicit approval; none were executed):
 10. [ ] Decide whether `restartPolicyType` should stay `ON_FAILURE` now that a
         degraded durable store makes `/api/v2/health` return 503 (an orchestrator
         may restart the instance; the kill switch lives in memory).
+
+11. [ ] Set a strong, unique `DASHBOARD_PASSWORD` on Railway before exposing the
+        app: without it every mutation is locked and `/api/config/validate`
+        reports `password_required:false`. Never paste the value into chat, a
+        PR, an issue or a commit.
+12. [ ] Keep `ENABLE_API_DOCS` unset on the public deployment (default off).
+        Set it to `true` only for a time-boxed debugging session.
+13. [ ] After deploy: `/api/health` must report
+        `components.broker.status=ok`/`account_status=ACTIVE`; with wrong Alpaca
+        keys it must report `auth_failed` with `ok=false, ready=true` (HTTP 200);
+        only the durable store may drive HTTP 503.
+14. [ ] With `DASHBOARD_PASSWORD` set, confirm `/api/v2/summary` returns 403
+        without the `X-Dashboard-Password` header and 200 with it (devtools).
+15. [ ] Remaining hardening (not in this PR): `/api/market/bars` and
+        `/api/v2/quotes` can still trigger upstream market-data fetches without a
+        credential; consider restricting symbols to the configured universe or
+        adding a read rate limit.

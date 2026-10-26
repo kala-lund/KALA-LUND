@@ -235,6 +235,90 @@ def test_hung_socket_is_bounded_by_the_installed_timeout():
     srv.close()
 
 
+# ---------------------------------------------------------------------------
+# Bounded, read-only account probe (diagnostics only; never submits an order).
+# ---------------------------------------------------------------------------
+PAPER = "https://paper-api.alpaca.markets"
+KEY, SECRET = "PK" + "A" * 24, "SEC" + "b" * 40
+
+
+def _raising(exc):
+    def _read(label, fn):
+        raise exc
+    return _read
+
+
+def test_probe_missing_credentials_makes_no_call():
+    b = Broker("", "", PAPER, False)
+    missing = b.probe()
+    assert missing["available"] is False
+    assert missing["status"] == "missing_credentials"
+    assert missing["paper"] is True
+    assert missing["endpoint"] == PAPER
+    assert missing["latency_ms"] is None
+    assert "credential" in missing["detail"].lower()
+
+
+def test_probe_rejected_credentials_are_classified(monkeypatch):
+    class _Resp:
+        status_code = 401
+
+    class _Err(Exception):
+        response = _Resp()
+
+    b = Broker(KEY, SECRET, PAPER, False)
+    monkeypatch.setattr(b, "_read", _raising(_Err("HTTP 401 Unauthorized")))
+    out = b.probe()
+    assert out["available"] is False
+    assert out["status"] == "auth_failed"
+    assert "401" in out["detail"]
+
+
+def test_probe_timeout_is_classified(monkeypatch):
+    b = Broker(KEY, SECRET, PAPER, False)
+    monkeypatch.setattr(b, "_read", _raising(
+        TimeoutError("Broker read 'probe_account' exceeded 10.0s")))
+    out = b.probe()
+    assert out["status"] == "timeout"
+    assert out["available"] is False
+    assert out["latency_ms"] is not None
+
+
+def test_probe_network_failure_is_classified(monkeypatch):
+    b = Broker(KEY, SECRET, PAPER, False)
+    monkeypatch.setattr(b, "_read", _raising(ConnectionError("Connection refused")))
+    out = b.probe()
+    assert out["status"] == "network_error"
+    assert out["available"] is False
+
+
+def test_probe_success_is_read_only_and_secret_free():
+    class _Account:
+        status = type("S", (), {"value": "ACTIVE"})()
+
+    class _Client:
+        _base_url = PAPER
+        _sandbox = True
+
+        def __init__(self):
+            self.calls = []
+
+        def get_account(self):
+            self.calls.append("get_account")
+            return _Account()
+
+    client = _Client()
+    b = Broker(KEY, SECRET, PAPER, True, client=client)
+    out = b.probe()
+    assert out["available"] is True and out["status"] == "ok"
+    assert out["account_status"] == "ACTIVE"
+    assert out["paper"] is True
+    # Exactly one read; nothing that could change order state exists on the fake.
+    assert client.calls == ["get_account"]
+    blob = str(out)
+    assert KEY not in blob and SECRET not in blob
+
+
 def test_send_aborts_without_submitting_when_account_read_times_out():
     """A broker timeout during verification must fail closed."""
     import requests

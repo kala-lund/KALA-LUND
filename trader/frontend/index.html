@@ -6,20 +6,21 @@
 <meta name="color-scheme" content="dark light">
 <meta name="description" content="KALA-LUND paper-trading terminal: portfolio, market watchlist, strategy signals, backtests, risk and system health.">
 <title>KALA-LUND · Paper Trading Terminal</title>
-<link rel="stylesheet" href="/static/styles.css?v=7">
+<link rel="stylesheet" href="/static/styles.css?v=8">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to main content</a>
 
-<!-- Password gate. Read-only data stays visible; order/kill/automation
-     controls require the dashboard password and are never stored. -->
+<!-- Password gate. Health, market data and configuration stay visible; account
+     data (balances, positions, orders, logs, signals) and every control require
+     the dashboard password. It is never stored: no localStorage, cookie or URL. -->
 <div id="authModal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="authTitle" aria-describedby="authHelp">
   <form class="modal-card" id="authForm" autocomplete="off">
     <div class="modal-head">
       <span class="brand-mark" aria-hidden="true">KL</span>
       <div>
-        <h2 id="authTitle">Unlock trading controls</h2>
-        <p id="authHelp" class="muted">The dashboard is view-only until you unlock it. The password is kept in memory only and is cleared when this tab closes.</p>
+        <h2 id="authTitle">Unlock the dashboard</h2>
+        <p id="authHelp" class="muted">Account data is locked. Enter the dashboard password to load balances, positions, orders and logs, and to enable trading controls. The password is kept in memory for this tab only and is cleared when you lock or close it.</p>
       </div>
     </div>
     <label class="field">
@@ -29,7 +30,7 @@
     <p id="authErr" class="form-error" role="alert" hidden></p>
     <div class="modal-actions">
       <button class="btn primary" type="submit" id="authSubmit">Unlock</button>
-      <button class="btn ghost" type="button" id="authReadonly">Continue read-only</button>
+      <button class="btn ghost" type="button" id="authReadonly">Stay locked</button>
     </div>
     <p class="muted small">Paper trading only. Live trading is disabled by design.</p>
   </form>
@@ -68,9 +69,9 @@
       </div>
       <div class="topbar-actions">
         <span class="pill paper" title="Live trading is prohibited">PAPER</span>
-        <span class="conn" id="conn"><i class="dot" aria-hidden="true"></i><span>Connecting…</span></span>
+        <span class="conn" id="conn" role="status" aria-live="polite"><i class="dot" aria-hidden="true"></i><span>Connecting…</span></span>
         <button class="btn icon" id="btnRefresh" type="button" title="Refresh current view" aria-label="Refresh current view">↻</button>
-        <button class="btn ghost" id="btnLock" type="button">Lock</button>
+        <button class="btn ghost" id="btnLock" type="button" aria-pressed="false">Lock</button>
       </div>
     </header>
 
@@ -83,6 +84,7 @@
       <span id="statusMode">mode —</span>
       <span id="statusSymbols">symbols —</span>
       <span id="statusTimeframe">timeframe —</span>
+      <span id="statusAuth">auth —</span>
       <span id="statusUpdated">updated —</span>
       <span class="spacer"></span>
       <span id="statusDb">db —</span>
@@ -92,7 +94,7 @@
 
 <div id="toasts" class="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 
-<script src="/static/config.js?v=7" defer></script>
-<script src="/static/app.js?v=7" defer></script>
+<script src="/static/config.js?v=8" defer></script>
+<script src="/static/app.js?v=8" defer></script>
 </body>
 </html>

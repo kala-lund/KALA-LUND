@@ -32,7 +32,14 @@
 #   CORS_ORIGINS        - comma-separated frontend origins, e.g. https://<project>.pages.dev
 #   TRUST_PROXY_HEADERS - set "true" behind Railway's edge so per-client rate
 #                         limiting uses the appended X-Forwarded-For address
-#   DASHBOARD_PASSWORD  - gates order / kill-switch / automation endpoints
+#   DASHBOARD_PASSWORD  - gates every state-changing endpoint (orders, kill
+#                         switch, automation, pipeline/backtest/walkforward) AND,
+#                         when set, all account-data reads (portfolio, positions,
+#                         orders, logs, signals, performance) via the
+#                         X-Dashboard-Password header. Leave unset only for local
+#                         development; operations stay locked without it.
+#   ENABLE_API_DOCS     - optional, default false. Exposes /docs, /redoc and
+#                         /openapi.json; keep off on a public deployment.
 #   ALPACA_API_KEY      - Alpaca PAPER key id (optional until market data is needed)
 #   ALPACA_API_SECRET   - Alpaca PAPER secret (optional until market data is needed)
 #   REDIS_URL           - optional Redis cache (falls back to in-process cache)

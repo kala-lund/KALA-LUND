@@ -93,22 +93,34 @@ class RedisCache:
     def health_check(self) -> dict:
         """Return a sanitized, independent health report for Redis.
 
-        Uses PING. Never includes the connection URL, password, or raw
-        error text. Does not claim Redis is connected when it is not.
+        Performs a real PING (the client is built with ``socket_timeout=2``) and
+        attempts one rate-limited reconnect when Redis was previously lost, so a
+        recovered instance is reported healthy again instead of staying degraded
+        for the process lifetime. Never includes the connection URL, password, or
+        raw error text. ``fallback`` is true only when Redis is configured but
+        the in-process cache is serving in its place.
         """
         if not self._redis_available or self._client is None:
-            return {"status": "error", "latency_ms": None,
-                    "error": "redis not available"}
-        import time
+            if self.redis_url:
+                self._maybe_reconnect()
+            if not self._redis_available or self._client is None:
+                return {"status": "error", "latency_ms": None,
+                        "error": "redis not available", "backend": "memory",
+                        "configured": bool(self.redis_url),
+                        "fallback": bool(self.redis_url)}
         start = time.perf_counter()
         try:
             self._client.ping()
-            return {"status": "ok", "latency_ms": round(
-                (time.perf_counter() - start) * 1000, 2), "error": None}
+            return {"status": "ok",
+                    "latency_ms": round((time.perf_counter() - start) * 1000.0, 2),
+                    "error": None, "backend": "redis",
+                    "configured": True, "fallback": False}
         except Exception as exc:  # noqa: BLE001 - report, don't crash
             self._redis_available = False
             return {"status": "error", "latency_ms": None,
-                    "error": safe_msg(exc)}
+                    "error": safe_msg(exc), "backend": "memory",
+                    "configured": bool(self.redis_url),
+                    "fallback": bool(self.redis_url)}
 
     def close(self) -> None:
         """Close the Redis client and release resources."""

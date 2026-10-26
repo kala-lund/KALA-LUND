@@ -614,3 +614,36 @@ and loop halt/trip behaviour.
 Not verified: behaviour against an actually-down Neon branch (the 503 path is
 proven by unit tests with a stubbed store, and by the startup-refusal probe
 above, not by breaking production connectivity).
+
+## 2026-10-26 - Production-audit hardening (auth/health/frontend) - executed evidence
+
+Branch `fix/production-audit-hardening` (based on `main` @ `2782e48`).
+Environment: Windows, `.venv`. Read-only evidence only: no orders were
+submitted or cancelled, no live trading, no Railway changes, no deploy.
+
+| # | Command | Result |
+|---|---|---|
+| 1 | `python -m compileall -q trader scripts` | PASS (exit 0) |
+| 2 | `node --check trader/frontend/app.js` | PASS (exit 0) |
+| 3 | `pytest trader/tests/test_frontend_assets.py test_security.py test_broker.py test_api_dashboard.py test_api.py test_cache.py -q` | **90 passed** (81.5 s) |
+| 4 | `pytest trader/tests -q --deselect trader/tests/test_frontend_assets.py` | **193 passed, 2 skipped, 8 deselected** (68.0 s) |
+| 5 | `pytest unit_tests -q` | 78 passed, 1 skipped, 3 xfailed, **2 failed** - pre-existing `test_alpaca_downloader` 401 (file unmodified, hardcoded `API_KEY = "???"`) |
+| 6 | `git diff --check` | exit 0 (no whitespace errors) |
+| 7 | `Broker.probe()` against `https://paper-api.alpaca.markets` using `.env` credentials, read-only `GET /v2/account` | `status=ok, available=true, account_status=ACTIVE`; cold 3943.6 ms, warm 372.4 / 280.2 ms; secret-leak check CLEAN |
+
+New coverage added on this branch: mutation-auth matrix (every state-changing
+route rejects without a credential, 403 when `DASHBOARD_PASSWORD` is unset),
+header-only credential acceptance, query-string credential rejection, gated vs
+public read matrix, auth brute-force 429, compute-endpoint 429, docs opt-in
+(`ENABLE_API_DOCS`), CORS wildcard/untrusted-origin rejection, broker/Redis
+degradation without 503, hung broker probe not blocking `/api/health`,
+`public_error`/`public_text` scrubbing, `probe()` status classification,
+flat-vs-unavailable positions contract, and `components.db.latency_ms`.
+
+Frontend verification was static only (`node --check`, asset/CSP regression
+tests, manual review of the diff). No browser was used, so interactive
+behaviour (modal focus, unlock refresh, locked placeholders) is reviewed but
+not automated-tested.
+
+Not verified: Docker image build (Docker daemon unavailable) and the deployed
+503 path against a real Neon outage.

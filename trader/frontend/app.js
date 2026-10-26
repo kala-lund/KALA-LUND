@@ -25,8 +25,15 @@
     config: null,
     health: null,
     db: null,
+    // The dashboard password lives in this object only: never localStorage,
+    // sessionStorage, cookies or the URL. It leaves the tab exclusively through
+    // the X-Dashboard-Password header and the existing POST JSON bodies.
     pwd: "",
     ops: false,
+    authState: "unknown", // unknown | unlocked | locked | throttled
+    authNote: "",
+    authToast: "",
+    authCooldownUntil: 0,
     theme: localStorage.getItem("kl-theme") || "dark",
     lastJob: null,
     jobPoll: null,
@@ -39,6 +46,13 @@
   const getCache = new Map();
   const inflight = new Map();
   const FETCH_TIMEOUT = 20000;
+  // Cache scopes keep authenticated and anonymous reads of the same path apart:
+  // an unlocked response must never be served to a locked session, or the other
+  // way round.
+  const CACHE_AUTH = "auth:";
+  const CACHE_ANON = "anon:";
+  const AUTH_HEADER = "X-Dashboard-Password";
+  const LOCKED_MSG = "Account data is locked. Enter the dashboard password to view balances, positions, orders and logs.";
 
   /* ---------------- formatting ---------------- */
   const isNum = (v) => typeof v === "number" && Number.isFinite(v);
@@ -93,6 +107,18 @@
     if (Number.isNaN(d.getTime())) return String(iso);
     return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   }
+  function tzName() {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "local time"; }
+    catch { return "local time"; }
+  }
+  function stamp(iso) {
+    // Server timestamps are UTC ISO-8601; show them in the browser's zone and
+    // label the zone so a reader never has to guess.
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    return `${d.toLocaleString()} ${tzName()}`;
+  }
 
   /* ---------------- errors / toasts ---------------- */
   function recordError(where, err) {
@@ -118,16 +144,39 @@
   }
 
   /* ---------------- HTTP ---------------- */
+  function cacheScope(auth) {
+    // Only a request that will actually carry the header may use the
+    // authenticated cache scope.
+    return auth && state.pwd ? CACHE_AUTH : CACHE_ANON;
+  }
+
+  function cacheKey(path, auth) {
+    return cacheScope(auth) + path;
+  }
+
+  function clearCache({ authOnly = false, anonOnly = false } = {}) {
+    for (const key of Array.from(getCache.keys())) {
+      if (authOnly && !key.startsWith(CACHE_AUTH)) continue;
+      if (anonOnly && !key.startsWith(CACHE_ANON)) continue;
+      getCache.delete(key);
+    }
+  }
+
   async function rawRequest(path, opts = {}) {
     const method = (opts.method || "GET").toUpperCase();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), opts.timeout || FETCH_TIMEOUT);
+    const headers = {};
+    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+    // Account-data reads send the dashboard credential as a header only, and
+    // only while unlocked. It is never appended to the path or a query string.
+    if (opts.auth && state.pwd) headers[AUTH_HEADER] = state.pwd;
     let res;
     let text = "";
     try {
       res = await fetch(API_BASE + path, {
         method,
-        headers: opts.body !== undefined ? { "Content-Type": "application/json" } : undefined,
+        headers: Object.keys(headers).length ? headers : undefined,
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: ctrl.signal,
         cache: "no-store",
@@ -150,33 +199,37 @@
     return body;
   }
 
-  async function apiGet(path, { ttl = 5000, force = false, timeout = FETCH_TIMEOUT } = {}) {
-    const hit = getCache.get(path);
+  async function apiGet(path, { ttl = 5000, force = false, timeout = FETCH_TIMEOUT, auth = false } = {}) {
+    const key = cacheKey(path, auth);
+    const hit = getCache.get(key);
     if (!force && hit && Date.now() - hit.t < ttl) return hit.v;
-    if (inflight.has(path)) return inflight.get(path);
+    if (inflight.has(key)) return inflight.get(key);
     const run = (async () => {
       let lastErr;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const value = await rawRequest(path, { timeout });
-          getCache.set(path, { t: Date.now(), v: value });
+          const value = await rawRequest(path, { timeout, auth });
+          getCache.set(key, { t: Date.now(), v: value });
           return value;
         } catch (e) {
           lastErr = e;
+          // 403 (locked / rejected credential) and 429 (throttled) are terminal:
+          // retrying a credential failure cannot succeed and would turn the poll
+          // loop into a password oracle.
           const retryable = !e.status || e.status >= 500;
           if (!retryable || attempt === 1) break;
           await new Promise((r) => setTimeout(r, 400));
         }
       }
       throw lastErr;
-    })().finally(() => inflight.delete(path));
-    inflight.set(path, run);
+    })().finally(() => inflight.delete(key));
+    inflight.set(key, run);
     return run;
   }
 
-  async function apiPost(path, body, { timeout = 30000 } = {}) {
+  async function apiPost(path, body, { timeout = 30000, auth = false } = {}) {
     // Mutations are never retried blindly: a duplicate POST could place an order twice.
-    return rawRequest(path, { method: "POST", body, timeout });
+    return rawRequest(path, { method: "POST", body, timeout, auth });
   }
 
   async function safeGet(path, opts) {
@@ -186,6 +239,86 @@
       recordError(path, e);
       return { ok: false, error: e };
     }
+  }
+
+  /* ---------------- auth state ---------------- */
+  function passwordRequired() {
+    return !!(state.config && state.config.password_required === true);
+  }
+
+  function isLocked() {
+    // Fail closed only when the server told us a credential exists, or when a
+    // gated read already answered 403 (config may be unreachable). A local
+    // install without DASHBOARD_PASSWORD keeps working exactly as before.
+    if (!state.pwd && state.authState === "locked") return true;
+    return passwordRequired() && !state.pwd;
+  }
+
+  function isThrottled() {
+    return state.authCooldownUntil > Date.now();
+  }
+
+  function authError(e) {
+    return !!e && (e.status === 403 || e.status === 429);
+  }
+
+  function authNote() {
+    if (state.authState === "throttled" && isThrottled()) {
+      const secs = Math.max(1, Math.ceil((state.authCooldownUntil - Date.now()) / 1000));
+      return `${state.authNote || "Credential attempts throttled."} Retry in ${secs}s.`;
+    }
+    if (state.authState === "locked" && state.authNote) return state.authNote;
+    return "";
+  }
+
+  function noteAuthFailure(e) {
+    const status = e && e.status;
+    const msg = String((e && e.message) || "credential rejected");
+    if (status === 429) {
+      // Back off for longer than the server window instead of hammering it.
+      state.authState = "throttled";
+      state.authNote = "Too many credential attempts.";
+      state.authCooldownUntil = Date.now() + 60000;
+    } else {
+      state.authState = "locked";
+      state.authNote = /invalid password/i.test(msg)
+        ? "The server rejected the dashboard password. Unlock again with the current password."
+        : "Account data requires the dashboard password.";
+      state.authCooldownUntil = 0;
+      // A credential the server rejects is useless: drop it so the next poll
+      // renders the locked placeholder instead of repeating the 403.
+      if (state.pwd || state.ops) {
+        state.pwd = "";
+        state.ops = false;
+        updateLockButton();
+      }
+      clearCache({ authOnly: true });
+    }
+    if (state.authToast !== state.authNote) {
+      state.authToast = state.authNote;
+      toast(state.authNote, "warn");
+    }
+  }
+
+  async function gatedGet(path, opts = {}) {
+    // Gated account reads: skipped entirely while locked or throttled so the
+    // polling loop never sends an unauthenticated request it knows will fail.
+    if (isLocked()) {
+      return { ok: false, locked: true, error: apiError("Account data is locked.") };
+    }
+    if (isThrottled()) {
+      return { ok: false, throttled: true, error: apiError(authNote()) };
+    }
+    const res = await safeGet(path, { ...opts, auth: true });
+    if (!res.ok && authError(res.error)) {
+      noteAuthFailure(res.error);
+      return { ok: false, locked: res.error.status === 403, throttled: res.error.status === 429, error: res.error };
+    }
+    return res;
+  }
+
+  function authBlocked(...results) {
+    return results.some((r) => r && (r.locked || r.throttled));
   }
 
   /* ---------------- chart renderers ---------------- */
@@ -320,12 +453,128 @@
   }
 
   /* ---------------- shared fragments ---------------- */
+  function badge(kind, text) {
+    // Text always accompanies the colour: never status by colour alone.
+    const cls = kind === "ok" ? "ok" : kind === "bad" ? "bad" : kind === "warn" ? "warn" : "mut";
+    return `<span class="pill ${cls}">${esc(text)}</span>`;
+  }
+
+  function kvRow(label, value) {
+    return `<div class="kv"><span class="k">${esc(label)}</span><span class="v">${esc(value === undefined || value === null || value === "" ? "—" : String(value))}</span></div>`;
+  }
+
+  function latencyText(v) {
+    return isNum(v) ? `${num(v, 0)} ms` : "—";
+  }
+
+  function componentBadge(c) {
+    if (!c || typeof c.ok !== "boolean") return badge("mut", "unknown");
+    return c.ok ? badge("ok", "ok") : badge("warn", "degraded");
+  }
+
+  function brokerStatusText(status) {
+    switch (status) {
+      case "ok": return "reachable";
+      case "missing_credentials": return "credentials not configured";
+      case "auth_failed": return "credentials rejected (401/403)";
+      case "timeout": return "timed out";
+      case "network_error": return "network error";
+      case "tls_error": return "TLS error";
+      case "broker_error": return "broker error";
+      case "probing": return "probing";
+      default: return "unknown";
+    }
+  }
+
+  function notReadyReason(h) {
+    const storage = h.storage || {};
+    const comps = h.components || {};
+    if (storage.required && !storage.durable) return "not ready — durable store unavailable (HTTP 503 to /healthz)";
+    if (comps.config && comps.config.ok === false) return "not ready — configuration invalid (HTTP 503 to /healthz)";
+    return "not ready — this instance cannot serve traffic (HTTP 503 to /healthz)";
+  }
+
+  function degradedReason(h) {
+    const comps = h.components || {};
+    const failing = Object.entries(comps).filter(([, c]) => c && c.ok === false).map(([name]) => name);
+    return failing.length ? `degraded: ${failing.join(", ")}` : "reported degraded without a failing component";
+  }
+
+  function healthRow(name, c) {
+    if (!c) {
+      return `<div class="health-row">
+        <span class="h-name">${esc(name)}</span>
+        <span>${badge("mut", "unknown")}</span>
+        <span class="h-detail">no component data</span>
+      </div>`;
+    }
+    const detail = c.detail || (c.ok ? "ok" : "no detail reported");
+    const bits = [detail];
+    if (c.configured === false && c.ok) bits.push("not configured");
+    if (isNum(c.latency_ms)) bits.push(`${latencyText(c.latency_ms)}`);
+    return `<div class="health-row">
+      <span class="h-name">${esc(name)}</span>
+      <span>${componentBadge(c)}</span>
+      <span class="h-detail">${esc(bits.join(" · "))}${c.error ? ` — ${esc(c.error)}` : ""}</span>
+    </div>`;
+  }
+
   function healthRows(health) {
     if (!health || !health.components) return `<div class="empty">Health unavailable.</div>`;
-    return Object.entries(health.components).map(([name, c]) => {
-      const dot = c.ok ? "ok" : (c.configured === false ? "warn" : "bad");
-      return `<div class="kv"><span class="k">${esc(name)}</span><span class="v"><i class="badge-dot" style="background:var(--${dot === "ok" ? "ok" : dot === "warn" ? "warn" : "bad"})"></i>${esc(c.detail || (c.ok ? "ok" : "fail"))}</span></div>`;
-    }).join("");
+    const h = health;
+    const comps = h.components;
+    const storage = h.storage || {};
+    const broker = comps.broker || {};
+    const redis = comps.redis || {};
+    const ready = h.ready === true;
+    const healthy = h.ok === true;
+    const rows = Object.entries(comps).map(([name, c]) => healthRow(name, c)).join("");
+    return `<div class="health-rows" aria-live="polite" aria-atomic="false">
+      ${rows}
+      <div class="health-row">
+        <span class="h-name">Readiness</span>
+        <span>${ready ? badge("ok", "ready") : badge("bad", "not ready")}</span>
+        <span class="h-detail">${esc(ready ? "instance can take traffic" : notReadyReason(h))}</span>
+      </div>
+      <div class="health-row">
+        <span class="h-name">Overall</span>
+        <span>${healthy ? badge("ok", "healthy") : badge("warn", "degraded")}</span>
+        <span class="h-detail">${esc(healthy ? "all components report ok" : degradedReason(h))}</span>
+      </div>
+    </div>
+    <div class="health-facts">
+      ${kvRow("Mode", h.mode === "paper" ? "paper only" : (h.mode || "—"))}
+      ${kvRow("Snapshot", h.ts ? stamp(h.ts) : "—")}
+      ${kvRow("Store backend", `${storage.backend || "—"}${storage.durable ? " (durable)" : " (not durable)"}`)}
+      ${kvRow("Store required", storage.required === true ? "yes — readiness fails without it" : storage.required === false ? "no" : "—")}
+      ${kvRow("Store latency", latencyText(comps.db && comps.db.latency_ms))}
+      ${kvRow("Cache backend", redis.backend || "—")}
+      ${kvRow("Cache fallback", redis.fallback === true ? "in-process cache fallback" : redis.fallback === false ? "none" : "unknown")}
+      ${kvRow("Cache latency", latencyText(redis.latency_ms))}
+      ${kvRow("Broker endpoint", broker.endpoint ? `${broker.endpoint} · paper` : "—")}
+      ${kvRow("Broker status", brokerStatusText(broker.status))}
+      ${kvRow("Broker account", broker.account_status || "—")}
+      ${kvRow("Broker latency", latencyText(broker.latency_ms))}
+      ${kvRow("Broker probe age", isNum(broker.stale_seconds) ? `${num(broker.stale_seconds, 1)}s ago` : "—")}
+    </div>`;
+  }
+
+  function lockedPanel(title, hint) {
+    const note = authNote();
+    return `<div class="locked" role="group" aria-label="${esc(title || "Account data")} locked">
+      <div class="row"><span class="pill warn">locked</span><strong>${esc(title || "Account data")}</strong></div>
+      <p class="muted small">${esc(hint || LOCKED_MSG)}</p>
+      ${note ? `<p class="muted small">${esc(note)}</p>` : ""}
+      <div class="row"><button class="btn primary small" type="button" data-unlock="1">Unlock dashboard</button></div>
+    </div>`;
+  }
+
+  function brokerUnavailable(what, error) {
+    return `<div class="error-state" role="status">
+      <strong>${esc(what)} unavailable</strong>
+      <span>${esc(error || "The paper broker did not return account data.")}</span>
+      <span class="muted small">Shown as unavailable, never as a zero balance or an empty book.</span>
+    </div>`;
   }
 
   function quoteRow(q) {
@@ -366,19 +615,26 @@
     const res = await apiPost("/api/auth", { password });
     state.pwd = password;
     state.ops = true;
+    state.authState = "unlocked";
+    state.authNote = "";
+    state.authToast = "";
+    state.authCooldownUntil = 0;
     closeAuth();
     updateLockButton();
-    toast("Controls unlocked for this tab.", "ok");
+    // Anonymous cache entries must not survive the unlock: gated panels have to
+    // re-fetch with the credential.
+    clearCache();
+    toast("Unlocked for this tab.", "ok");
     return res;
   }
 
-  function ensureOps() {
-    if (state.ops) return true;
+  function ensureOps(what = "trading controls") {
+    if (state.ops && state.pwd) return true;
     if (state.config && state.config.password_required === false) {
       toast("Trading controls are locked: DASHBOARD_PASSWORD is not configured on the server.", "warn");
       return false;
     }
-    toast("Unlock the dashboard to use trading controls.", "warn");
+    toast(`Unlock the dashboard to use ${what}.`, "warn");
     openAuth();
     return false;
   }
@@ -388,6 +644,9 @@
     if (!b) return;
     b.textContent = state.ops ? "Lock" : "Unlock";
     b.setAttribute("aria-pressed", state.ops ? "true" : "false");
+    b.title = state.ops
+      ? "Clear the in-memory password and hide account data"
+      : "Enter the dashboard password to load account data and enable controls";
   }
 
   /* ---------------- chrome ---------------- */
@@ -432,27 +691,52 @@
     const h = health || state.health;
     const cfg = config || state.config;
     const ok = !!(h && h.ok);
+    const ready = !!(h && h.ready);
     const conn = $("#conn");
     if (conn) {
       const dot = $(".dot", conn);
-      if (dot) dot.className = "dot " + (h ? (ok ? "ok" : "warn") : "bad");
+      // Three distinct states: healthy, degraded (ready but a component is off),
+      // and dead/unreachable. Never render degraded as "Live".
+      if (dot) dot.className = "dot " + (h ? (ok ? "ok" : ready ? "warn" : "bad") : "bad");
       const label = $("span:last-child", conn);
-      if (label) label.textContent = h ? (ok ? "Live" : "Degraded") : "Offline";
+      if (label) label.textContent = h ? (ok ? "Live" : ready ? "Degraded" : "Not ready") : "Offline";
+      conn.title = h
+        ? `healthy ${ok ? "yes" : "no"} · ready ${ready ? "yes" : "no"} · mode ${h.mode || "unknown"} · ${h.ts ? stamp(h.ts) : "no timestamp"}`
+        : "no health response yet";
     }
     if (h) {
-      setDot("miniApi", ok ? "ok" : "bad", h.ts || "");
+      setDot("miniApi", ok ? "ok" : ready ? "warn" : "bad",
+        `${ok ? "healthy" : "degraded"} · ready ${ready ? "yes" : "no"}${h.ts ? " · " + stamp(h.ts) : ""}`);
       const dbc = h.components && h.components.db;
-      setDot("miniDb", dbc ? (dbc.ok ? "ok" : "bad") : "", dbc ? dbc.detail : "");
+      setDot("miniDb", dbc ? (dbc.ok ? "ok" : "warn") : "", dbc ? String(dbc.detail || "") : "");
       const rc = h.components && h.components.redis;
-      setDot("miniRedis", rc ? (rc.ok ? "ok" : (rc.configured ? "warn" : "")) : "", rc ? rc.detail : "");
+      setDot("miniRedis", rc ? (rc.ok ? "ok" : (rc.configured ? "warn" : "")) : "", rc ? String(rc.detail || "") : "");
+      const live = $("#liveStatus");
+      if (live) {
+        // Keep this region to state changes only: no timestamps, or a screen
+        // reader would announce on every poll.
+        live.textContent = `System ${ok ? "healthy" : "degraded"}; readiness ${ready ? "ready" : "not ready"}` +
+          `; paper mode ${h.mode === "paper" ? "confirmed" : "unconfirmed"}`;
+      }
     }
     if (cfg) {
-      $("#statusMode").textContent = `mode ${cfg.trading_mode || "—"} · live ${cfg.live ? "ON" : "off"}`;
-      $("#statusSymbols").textContent = `symbols ${cfg.n_symbols ?? "—"}`;
-      $("#statusTimeframe").textContent = `timeframe ${cfg.timeframe || "—"}`;
+      const mode = $("#statusMode");
+      if (mode) mode.textContent = `mode ${cfg.trading_mode || "—"} · live ${cfg.live ? "ON" : "off"}`;
+      const sym = $("#statusSymbols");
+      if (sym) sym.textContent = `symbols ${cfg.n_symbols ?? "—"}`;
+      const tf = $("#statusTimeframe");
+      if (tf) tf.textContent = `timeframe ${cfg.timeframe || "—"}`;
     }
-    $("#statusUpdated").textContent = `updated ${state.updatedAt ? shortTime(state.updatedAt) : "—"}`;
-    $("#statusDb").textContent = h && h.components && h.components.db ? `db ${h.components.db.detail}` : "db —";
+    const updated = $("#statusUpdated");
+    if (updated) updated.textContent = `updated ${state.updatedAt ? shortTime(state.updatedAt) : "—"} ${tzName()}`;
+    const statusDb = $("#statusDb");
+    if (statusDb) statusDb.textContent = h && h.components && h.components.db ? `db ${h.components.db.detail}` : "db —";
+    const statusAuth = $("#statusAuth");
+    if (statusAuth) {
+      statusAuth.textContent = state.pwd
+        ? "auth unlocked"
+        : passwordRequired() ? "auth locked" : (state.config ? "auth not required" : "auth —");
+    }
   }
 
   async function refreshChrome() {
@@ -475,8 +759,8 @@
       <div class="skeleton" style="min-height:220px"></div>
     </div>`;
     const [health, cfg, summary, positions, perf, auto, quotes, db] = await Promise.all([
-      safeGet("/api/health"), safeGet("/api/config/validate"), safeGet("/api/v2/summary"),
-      safeGet("/api/v2/positions"), safeGet("/api/v2/performance"), safeGet("/api/v2/automate/status"),
+      safeGet("/api/health"), safeGet("/api/config/validate"), gatedGet("/api/v2/summary"),
+      gatedGet("/api/v2/positions"), gatedGet("/api/v2/performance"), safeGet("/api/v2/automate/status"),
       safeGet("/api/v2/quotes"), safeGet("/api/v2/db"),
     ]);
     if (seq !== viewSeq) return;
@@ -485,36 +769,49 @@
     if (db.ok) state.db = db.value;
     updateChrome(health.ok ? health.value : null, cfg.ok ? cfg.value : null);
 
+    const acctLocked = authBlocked(summary, positions);
+    const perfLocked = authBlocked(perf);
     const s = summary.ok ? summary.value : null;
     const available = !!(s && s.available);
     const dbv = db.ok ? db.value : {};
-    const dbOk = dbv.configured ? dbv.ok : true;
+    // Only an explicit ok=true is shown as healthy; a failed/absent report is
+    // never coloured green.
+    const dbOk = dbv.ok === true;
 
-    const kpis = available
-      ? [
-        kpi("Equity", money(s.equity), s.status || "paper account", "ok"),
-        kpi("Cash", money(s.cash), "settled cash"),
-        kpi("Buying power", money(s.buying_power), "available margin"),
-        kpi("Day P&L", signedMoney(s.day_pnl), "broker session", tone(s.day_pnl)),
-        kpi("Unrealized P&L", signedMoney(s.unrealized_pl), `${s.positions} position(s)`, tone(s.unrealized_pl)),
-        kpi("Drawdown", pctPts(-Math.abs(s.drawdown_pct || 0)), `peak ${money(s.peak)}`, (s.drawdown_pct || 0) > 0 ? "warn" : ""),
-      ].join("")
-      : [
-        kpi("Equity", "—", "broker unavailable", "", true),
-        kpi("Cash", "—", "broker unavailable", "", true),
-        kpi("Buying power", "—", "broker unavailable", "", true),
-        kpi("Day P&L", "—", "broker unavailable", "", true),
-        kpi("Unrealized P&L", "—", "broker unavailable", "", true),
-        kpi("Drawdown", "—", "broker unavailable", "", true),
-      ].join("");
+    const kpis = acctLocked
+      ? ""
+      : available
+        ? [
+          kpi("Equity", money(s.equity), s.source === "broker" ? "broker-reported · paper" : (s.status || "paper account"), "ok"),
+          kpi("Cash", money(s.cash), "settled cash"),
+          kpi("Buying power", money(s.buying_power), "available margin"),
+          kpi("Day P&L", signedMoney(s.day_pnl), "broker session", tone(s.day_pnl)),
+          kpi("Unrealized P&L", signedMoney(s.unrealized_pl), `${num(s.positions, 0)} position(s)`, tone(s.unrealized_pl)),
+          kpi("Drawdown", pctPts(-Math.abs(s.drawdown_pct || 0)), `peak ${money(s.peak)}`, (s.drawdown_pct || 0) > 0 ? "warn" : ""),
+        ].join("")
+        : [
+          kpi("Equity", "—", "broker unavailable", "", true),
+          kpi("Cash", "—", "broker unavailable", "", true),
+          kpi("Buying power", "—", "broker unavailable", "", true),
+          kpi("Day P&L", "—", "broker unavailable", "", true),
+          kpi("Unrealized P&L", "—", "broker unavailable", "", true),
+          kpi("Drawdown", "—", "broker unavailable", "", true),
+        ].join("");
 
     let alert = "";
-    if (!summary.ok) alert = banner("bad", `Account summary unavailable: ${summary.error.message}`);
+    if (acctLocked) alert = "";
+    else if (!summary.ok) alert = banner("bad", `Account summary unavailable: ${summary.error.message}`);
     else if (!available) alert = banner("warn", `Paper broker account not readable (${s.error || "no credentials"}). Values are shown as unavailable, never as zero.`);
+
+    const acctMeta = acctLocked || !available
+      ? ""
+      : `<p class="muted small">Paper account · source ${esc(s.source || "unknown")} · as of ${esc(shortTime(s.as_of))} ${esc(tzName())} · values are broker-reported, not simulated.</p>`;
 
     // Equity / benchmark from the most recent completed backtest.
     let perfCard;
-    if (!perf.ok) {
+    if (perfLocked) {
+      perfCard = lockedPanel("Performance history");
+    } else if (!perf.ok) {
       perfCard = errorBox("Performance", perf.error);
     } else if (perf.value.source === "none") {
       perfCard = `<div class="empty"><strong>No backtest yet</strong><span>${esc(perf.value.message || "Run one from the Backtest tab.")}</span></div>`;
@@ -541,14 +838,20 @@
 
     // Allocation from real positions only.
     let alloc = `<div class="empty">Allocation unavailable.</div>`;
-    if (positions.ok && positions.value.available && positions.value.positions.length) {
+    if (positions.locked || positions.throttled) {
+      alloc = lockedPanel("Allocation");
+    } else if (!positions.ok) {
+      alloc = errorBox("Positions", positions.error);
+    } else if (!positions.value.available) {
+      alloc = brokerUnavailable("Allocation", positions.value.error);
+    } else if (positions.value.positions.length) {
       const rows = positions.value.positions;
       const total = rows.reduce((a, p) => a + Math.abs(Number(p.market_value) || 0), 0);
       alloc = allocationBlock(rows.map((p) => ({
         symbol: p.symbol,
         pct: total > 0 ? (Math.abs(Number(p.market_value) || 0) / total) * 100 : 0,
       })).sort((a, b) => b.pct - a.pct));
-    } else if (positions.ok) {
+    } else {
       alloc = `<div class="empty">Flat book — no allocation to display.</div>`;
     }
 
@@ -557,14 +860,16 @@
         ? `<div class="table-wrap"><table class="data"><caption class="sr-only">Watchlist quotes</caption>
             <thead><tr><th>Symbol</th><th class="num">Last</th><th class="num">Change</th><th class="num">%</th><th>Quality</th></tr></thead>
             <tbody>${quotes.value.quotes.map(quoteRow).join("")}</tbody></table></div>
-          <p class="muted small" style="margin-top:6px">As of ${esc(quotes.value.as_of || "—")} · ${esc(quotes.value.timeframe || "")}</p>`
+          <p class="muted small" style="margin-top:6px">As of ${esc(stamp(quotes.value.as_of))} · ${esc(quotes.value.timeframe || "")}</p>`
         : `<div class="empty">No configured symbols.</div>`)
       : errorBox("Watchlist", quotes.error);
 
     const autoV = auto.ok ? auto.value : null;
     root.innerHTML = `<div class="stack">
       ${alert}
-      <section class="grid kpis" aria-label="Account metrics">${kpis}</section>
+      ${acctLocked
+        ? lockedPanel("Account metrics")
+        : `<section class="grid kpis" aria-label="Account metrics">${kpis}</section>${acctMeta}`}
       <section class="grid two">
         <div class="card">
           <div class="card-head"><h2>Equity &amp; benchmark</h2><span class="sub">${esc((perf.ok && perf.value.symbol) || "latest backtest")}</span></div>
@@ -573,8 +878,8 @@
         <div class="card">
           <div class="card-head"><h2>Allocation</h2><span class="sub">by market value</span></div>
           ${alloc}
-          <div class="kv" style="margin-top:10px"><span class="k">Exposure</span><span class="v">${available ? pctPts(s.exposure_pct) + " of equity" : "—"}</span></div>
-          <div class="kv"><span class="k">Positions</span><span class="v">${available ? s.positions : "—"}</span></div>
+          ${acctLocked ? "" : `<div class="kv" style="margin-top:10px"><span class="k">Exposure</span><span class="v">${available ? pctPts(s.exposure_pct) + " of equity" : "—"}</span></div>
+          <div class="kv"><span class="k">Positions</span><span class="v">${available ? num(s.positions, 0) : "—"}</span></div>`}
         </div>
       </section>
       <section class="grid two">
@@ -584,9 +889,9 @@
         </div>
         <div class="stack">
           <div class="card">
-            <div class="card-head"><h2>System health</h2><span class="sub">${esc((health.ok && health.value.ts) || "offline")}</span></div>
+            <div class="card-head"><h2>System health</h2><span class="sub">${esc((health.ok && health.value.ts) ? stamp(health.value.ts) : "offline")}</span></div>
             ${health.ok ? healthRows(health.value) : errorBox("Health", health.error)}
-            <div class="kv" style="margin-top:8px"><span class="k">Durable store</span><span class="v ${dbOk ? "ok" : "bad"}">${dbv.configured ? (dbv.ok ? `schema v${dbv.schema_version} · ${dbv.counts ? dbv.counts.orders + dbv.counts.signals + dbv.counts.backtests : 0} rows` : "verification failed") : "not configured"}</span></div>
+            <div class="kv" style="margin-top:8px"><span class="k">Durable store</span><span class="v ${dbOk ? "ok" : "bad"}">${!db.ok ? "unavailable" : dbv.configured ? (dbv.ok ? `schema v${dbv.schema_version} · ${dbv.counts ? dbv.counts.orders + dbv.counts.signals + dbv.counts.backtests : 0} rows` : "verification failed") : "not configured"}</span></div>
           </div>
           <div class="card">
             <div class="card-head"><h2>Automation</h2><span class="pill ${autoV && autoV.running ? "ok" : "mut"}">${autoV && autoV.running ? "running" : "off"}</span></div>
@@ -613,18 +918,22 @@
   VIEWS.portfolio = async (root, seq) => {
     root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:120px"></div><div class="skeleton" style="min-height:220px"></div></div>`;
     const [positions, orders, summary] = await Promise.all([
-      safeGet("/api/v2/positions"), safeGet("/api/v2/orders"), safeGet("/api/v2/summary"),
+      gatedGet("/api/v2/positions"), gatedGet("/api/v2/orders"), gatedGet("/api/v2/summary"),
     ]);
     if (seq !== viewSeq) return;
 
+    const acctLocked = authBlocked(positions, summary);
+    const ordersLocked = authBlocked(orders);
     const p = positions.ok ? positions.value : null;
     const s = summary.ok ? summary.value : null;
     const avail = !!(p && p.available);
     const rows = (p && p.positions) || [];
     const totalMv = rows.reduce((a, x) => a + Math.abs(Number(x.market_value) || 0), 0);
 
-    const summaryStrip = `<section class="grid kpis" aria-label="Account metrics">
-      ${kpi("Equity", avail ? money(p.account.equity) : "—", avail ? p.account.status : "unavailable", avail ? "ok" : "", !avail)}
+    // The broker's own error text is rendered inside each panel (never a zero
+    // balance or an empty book).
+    const summaryStrip = acctLocked ? lockedPanel("Account metrics") : `<section class="grid kpis" aria-label="Account metrics">
+      ${kpi("Equity", avail ? money(p.account.equity) : "—", avail ? (p.account.status || "broker-reported") : "unavailable", avail ? "ok" : "", !avail)}
       ${kpi("Cash", avail ? money(p.account.cash) : "—", "settled", "", !avail)}
       ${kpi("Buying power", avail ? money(p.account.bp) : "—", "available", "", !avail)}
       ${kpi("Positions value", avail ? money(totalMv) : "—", `${rows.length} holding(s)`, "", !avail)}
@@ -632,11 +941,13 @@
       ${kpi("Drawdown", avail && s && isNum(s.drawdown_pct) ? pctPts(-Math.abs(s.drawdown_pct)) : "—", "from peak", "", !avail)}
     </section>`;
 
-    const positionsTable = !positions.ok
-      ? errorBox("Positions", positions.error)
-      : !avail
-        ? `<div class="banner warn">Positions unavailable (${esc(p.error || "broker read failed")}). This is not an empty book.</div>`
-        : rows.length
+    const positionsTable = positions.locked || positions.throttled
+      ? lockedPanel("Positions")
+      : !positions.ok
+        ? errorBox("Positions", positions.error)
+        : !avail
+          ? brokerUnavailable("Positions", p.error)
+          : rows.length
           ? `<div class="table-wrap"><table class="data">
               <caption class="sr-only">Open positions</caption>
               <thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Market value</th><th class="num">Cost</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th class="num">Alloc</th></tr></thead>
@@ -659,6 +970,41 @@
     const openOrders = (ordersV && ordersV.open) || [];
     const dbOpen = (ordersV && ordersV.db_open) || [];
     const hist = (ordersV && ordersV.history) || [];
+    const brokerOrdersOk = !!(ordersV && ordersV.broker_available !== false);
+    const ordersSub = ordersLocked
+      ? "locked"
+      : brokerOrdersOk ? `broker ${openOrders.length} · durable store ${dbOpen.length}` : `broker — · durable store ${dbOpen.length}`;
+
+    const ordersBody = ordersLocked
+      ? lockedPanel("Open orders")
+      : !orders.ok
+        ? errorBox("Orders", orders.error)
+        : `<div class="stack">
+            ${brokerOrdersOk ? "" : brokerUnavailable("Broker open orders", ordersV.open_error)}
+            ${(openOrders.length || dbOpen.length) ? `
+              <div class="table-wrap"><table class="data">
+                <caption class="sr-only">Open orders</caption>
+                <thead><tr><th>Symbol</th><th>Side</th><th class="num">Notional</th><th class="num">Qty</th><th>Status</th><th>Client order ID</th><th>Source</th></tr></thead>
+                <tbody>
+                  ${openOrders.map((o) => `<tr><td class="sym">${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${money(Number(o.notional || 0))}</td><td class="num">${qty(Number(o.qty || 0))}</td><td>${esc(o.status)}</td><td class="mono small">${esc(o.client_order_id || "—")}</td><td class="muted">broker</td></tr>`).join("")}
+                  ${dbOpen.filter((o) => !openOrders.some((b) => b.client_order_id === o.client_order_id)).map((o) => `<tr><td class="sym">${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${money(Number(o.notional || 0))}</td><td class="num">—</td><td>${esc(o.status)}</td><td class="mono small">${esc(o.client_order_id || "—")}</td><td class="muted">store</td></tr>`).join("")}
+                </tbody></table></div>`
+              : brokerOrdersOk ? `<div class="empty">No open orders.</div>` : ""}
+            ${ordersV.open_error && brokerOrdersOk ? `<p class="banner warn">${esc(ordersV.open_error)}</p>` : ""}
+            ${ordersV.db_error ? `<p class="banner warn">${esc(ordersV.db_error)}</p>` : ""}
+          </div>`;
+
+    const historyBody = ordersLocked
+      ? lockedPanel("Execution history")
+      : hist.length ? `<div class="table-wrap"><table class="data">
+          <caption class="sr-only">Execution history</caption>
+          <thead><tr><th>Submitted</th><th>Symbol</th><th>Side</th><th class="num">Filled qty</th><th class="num">Avg price</th><th>Status</th><th>Client order ID</th><th>Note</th></tr></thead>
+          <tbody>${hist.slice().reverse().map((x) => `<tr>
+            <td class="mono small">${esc(shortTime(x.ts))}</td><td class="sym">${esc(x.symbol || "—")}</td><td>${esc(x.side || "—")}</td>
+            <td class="num">${qty(Number(x.filled_qty || 0))}</td><td class="num">${x.filled_price ? money(Number(x.filled_price), 4) : "—"}</td>
+            <td class="${x.status === "filled" ? "ok" : x.status === "rejected" || x.status === "unknown" ? "bad" : ""}">${esc(x.status || "—")}</td>
+            <td class="mono small">${esc(x.cid || "—")}</td><td class="muted small">${esc(x.note || "")}</td>
+          </tr>`).join("")}</tbody></table></div>` : `<div class="empty">No executions recorded in this process. Durable order records appear above.</div>`;
 
     root.innerHTML = `<div class="stack">
       ${summaryStrip}
@@ -669,37 +1015,25 @@
         </div>
         <div class="card">
           <div class="card-head"><h2>Allocation</h2><span class="sub">market value</span></div>
-          ${rows.length ? allocationBlock(rows.map((x) => ({
-            symbol: x.symbol,
-            pct: totalMv > 0 ? (Math.abs(Number(x.market_value) || 0) / totalMv) * 100 : 0,
-          })).sort((a, b) => b.pct - a.pct)) : `<div class="empty">No allocation to display.</div>`}
+          ${acctLocked
+            ? lockedPanel("Allocation")
+            : !positions.ok
+              ? errorBox("Positions", positions.error)
+              : p && !p.available
+                ? brokerUnavailable("Allocation", p.error)
+                : rows.length ? allocationBlock(rows.map((x) => ({
+                  symbol: x.symbol,
+                  pct: totalMv > 0 ? (Math.abs(Number(x.market_value) || 0) / totalMv) * 100 : 0,
+                })).sort((a, b) => b.pct - a.pct)) : `<div class="empty">No allocation to display.</div>`}
         </div>
       </section>
       <section class="card">
-        <div class="card-head"><h2>Open orders</h2><span class="sub">broker ${openOrders.length} · durable store ${dbOpen.length}</span></div>
-        ${!orders.ok ? errorBox("Orders", orders.error) : (openOrders.length || dbOpen.length) ? `
-          <div class="table-wrap"><table class="data">
-            <caption class="sr-only">Open orders</caption>
-            <thead><tr><th>Symbol</th><th>Side</th><th class="num">Notional</th><th class="num">Qty</th><th>Status</th><th>Client order ID</th><th>Source</th></tr></thead>
-            <tbody>
-              ${openOrders.map((o) => `<tr><td class="sym">${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${money(Number(o.notional || 0))}</td><td class="num">${qty(Number(o.qty || 0))}</td><td>${esc(o.status)}</td><td class="mono small">${esc(o.client_order_id || "—")}</td><td class="muted">broker</td></tr>`).join("")}
-              ${dbOpen.filter((o) => !openOrders.some((b) => b.client_order_id === o.client_order_id)).map((o) => `<tr><td class="sym">${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${money(Number(o.notional || 0))}</td><td class="num">—</td><td>${esc(o.status)}</td><td class="mono small">${esc(o.client_order_id || "—")}</td><td class="muted">store</td></tr>`).join("")}
-            </tbody></table></div>
-          ${ordersV.open_error ? `<p class="banner warn" style="margin-top:8px">${esc(ordersV.open_error)}</p>` : ""}
-          ${ordersV.db_error ? `<p class="banner warn" style="margin-top:8px">${esc(ordersV.db_error)}</p>` : ""}`
-          : `<div class="empty">No open orders.</div>`}
+        <div class="card-head"><h2>Open orders</h2><span class="sub">${esc(ordersSub)}</span></div>
+        ${ordersBody}
       </section>
       <section class="card">
-        <div class="card-head"><h2>Execution history</h2><span class="sub">this process · ${hist.length}</span></div>
-        ${hist.length ? `<div class="table-wrap"><table class="data">
-          <caption class="sr-only">Execution history</caption>
-          <thead><tr><th>Submitted</th><th>Symbol</th><th>Side</th><th class="num">Filled qty</th><th class="num">Avg price</th><th>Status</th><th>Client order ID</th><th>Note</th></tr></thead>
-          <tbody>${hist.slice().reverse().map((x) => `<tr>
-            <td class="mono small">${esc(shortTime(x.ts))}</td><td class="sym">${esc(x.symbol || "—")}</td><td>${esc(x.side || "—")}</td>
-            <td class="num">${qty(Number(x.filled_qty || 0))}</td><td class="num">${x.filled_price ? money(Number(x.filled_price), 4) : "—"}</td>
-            <td class="${x.status === "filled" ? "ok" : x.status === "rejected" || x.status === "unknown" ? "bad" : ""}">${esc(x.status || "—")}</td>
-            <td class="mono small">${esc(x.cid || "—")}</td><td class="muted small">${esc(x.note || "")}</td>
-          </tr>`).join("")}</tbody></table></div>` : `<div class="empty">No executions recorded in this process. Durable order records appear above.</div>`}
+        <div class="card-head"><h2>Execution history</h2><span class="sub">this process · ${ordersLocked ? "—" : hist.length}</span></div>
+        ${historyBody}
       </section>
     </div>`;
   };
@@ -718,7 +1052,7 @@
 
     root.innerHTML = `<div class="stack">
       <div class="card">
-        <div class="card-head"><h2>Market watch</h2><span class="sub">${quotes.ok ? esc(quotes.value.as_of || "") : "offline"}</span></div>
+        <div class="card-head"><h2>Market watch</h2><span class="sub">${quotes.ok ? esc(stamp(quotes.value.as_of)) : "offline"}</span></div>
         ${quotes.ok ? `<div class="table-wrap"><table class="data">
           <caption class="sr-only">Watchlist quotes</caption>
           <thead><tr><th>Symbol</th><th class="num">Last</th><th class="num">Change</th><th class="num">%</th><th>Quality</th></tr></thead>
@@ -779,8 +1113,9 @@
 
   VIEWS.strategies = async (root, seq) => {
     root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:160px"></div><div class="skeleton" style="min-height:220px"></div></div>`;
-    const [signals, muse] = await Promise.all([safeGet("/api/v2/signals"), safeGet("/api/v2/muse")]);
+    const [signals, muse] = await Promise.all([gatedGet("/api/v2/signals"), safeGet("/api/v2/muse")]);
     if (seq !== viewSeq) return;
+    const signalsLocked = authBlocked(signals);
     const sigs = signals.ok ? (signals.value.signals || {}) : {};
     const keys = Object.keys(sigs);
     const mu = muse.ok ? muse.value : null;
@@ -822,20 +1157,27 @@
         : errorBox("Muse status", muse.error)}
       </div>
       <div class="row between">
-        <h2 class="section-title" style="margin:0">Signals (${keys.length})</h2>
+        <h2 class="section-title" style="margin:0">Signals (${signalsLocked ? "—" : keys.length})</h2>
         <button class="btn primary" id="runPipeline" type="button">Run pipeline</button>
       </div>
-      ${keys.length ? `<div class="grid two-even">${cards}</div>` : `<div class="empty"><strong>No signals yet</strong><span>Run the pipeline once market data is available.</span></div>`}
+      ${signalsLocked
+        ? lockedPanel("Signals")
+        : !signals.ok
+          ? errorBox("Signals", signals.error)
+          : keys.length
+            ? `<div class="grid two-even">${cards}</div>`
+            : `<div class="empty"><strong>No signals yet</strong><span>Run the pipeline once market data is available.</span></div>`}
     </div>`;
 
     $("#runPipeline").addEventListener("click", async (e) => {
+      if (!ensureOps("the signal pipeline")) return;
       const btn = e.currentTarget;
       btn.disabled = true;
       btn.textContent = "Running…";
       try {
-        await apiPost("/api/pipeline/run", {});
+        await apiPost("/api/pipeline/run", { password: state.pwd });
         toast("Pipeline completed.", "ok");
-        getCache.clear();
+        clearCache();
         render();
       } catch (err) {
         recordError("/api/pipeline/run", err);
@@ -848,8 +1190,9 @@
 
   VIEWS.backtest = async (root, seq) => {
     root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:110px"></div><div class="skeleton" style="min-height:260px"></div></div>`;
-    const [cfg, perf] = await Promise.all([safeGet("/api/config/validate"), safeGet("/api/v2/performance")]);
+    const [cfg, perf] = await Promise.all([safeGet("/api/config/validate"), gatedGet("/api/v2/performance")]);
     if (seq !== viewSeq) return;
+    const perfLocked = authBlocked(perf);
     const c = cfg.ok ? cfg.value : (state.config || {});
     const symbols = (c.symbols || ["BTC/USD"]).slice(0, 40);
     const timeframes = ["1Min", "5Min", "15Min", "1H", "1D"];
@@ -865,7 +1208,7 @@
           <button class="btn ghost" id="bCancel" type="button" disabled>Cancel</button>
           <button class="btn ghost" id="bWalk" type="button">Walk-forward windows</button>
         </div>
-        <div id="bStatus" class="muted small" style="margin-top:10px">${perf.ok && perf.value.source === "none" ? esc(perf.value.message) : ""}</div>
+        <div id="bStatus" class="muted small" style="margin-top:10px">${!perfLocked && perf.ok && perf.value.source === "none" ? esc(perf.value.message) : ""}</div>
         <div class="progress" style="margin-top:8px"><span id="bProgress" style="width:0%"></span></div>
       </div>
       <div id="bResult"></div>
@@ -924,14 +1267,17 @@
       </div>`;
     };
 
-    renderResult(perf.ok ? perf.value : null);
+    if (perfLocked) $("#bResult").innerHTML = lockedPanel("Backtest results");
+    else renderResult(perf.ok ? perf.value : null);
 
     const pollJob = async (id) => {
       for (let i = 0; i < 90; i++) {
         await new Promise((r) => setTimeout(r, 1000));
         if (seq !== viewSeq) return;
         try {
-          const j = await apiGet(`/api/jobs/${id}`, { ttl: 0 });
+          // Job status is account data: authenticated header read, no retry on
+          // 403/429 (the loop below stops on any error).
+          const j = await apiGet(`/api/jobs/${id}`, { ttl: 0, auth: true });
           const pct = j.status === "done" ? 100 : j.status === "running" ? 60 : 15;
           $("#bProgress").style.width = pct + "%";
           $("#bStatus").textContent = `job ${id} · ${j.status}${j.error ? " · " + j.error : ""}`;
@@ -951,6 +1297,7 @@
             return;
           }
         } catch (e) {
+          if (authError(e)) noteAuthFailure(e);
           recordError(`/api/jobs/${id}`, e);
           $("#bStatus").textContent = `job status unavailable: ${e.message}`;
           $("#bRun").disabled = false;
@@ -965,6 +1312,7 @@
 
     $("#bRun").addEventListener("click", async (e) => {
       if (seq !== viewSeq) return;
+      if (!ensureOps("backtests")) return;
       const symbol = $("#bSymbol").value;
       const timeframe = $("#bTf").value;
       const limit = Math.max(60, Math.min(2000, Number($("#bLimit").value) || 300));
@@ -974,7 +1322,7 @@
       $("#bProgress").style.width = "10%";
       $("#bStatus").textContent = "submitting…";
       try {
-        const r = await apiPost("/api/backtest", { symbol, timeframe, limit });
+        const r = await apiPost("/api/backtest", { symbol, timeframe, limit, password: state.pwd });
         state.lastJob = r.job_id;
         $("#bStatus").textContent = `job ${r.job_id} · ${r.status}`;
         pollJob(r.job_id);
@@ -990,17 +1338,20 @@
 
     $("#bCancel").addEventListener("click", async () => {
       if (!state.lastJob) return;
+      if (!ensureOps("job cancel")) return;
       try {
         await apiPost(`/api/jobs/${state.lastJob}/cancel`, { password: state.pwd });
         $("#bStatus").textContent = `job ${state.lastJob} · cancel requested`;
       } catch (err) {
+        if (authError(err)) noteAuthFailure(err);
         toast(err.message, "bad");
       }
     });
 
     $("#bWalk").addEventListener("click", async () => {
+      if (!ensureOps("walk-forward windows")) return;
       try {
-        const r = await apiPost("/api/walkforward?n=1000&tr=400&va=200&te=200&step=200", {});
+        const r = await apiPost("/api/walkforward?n=1000&tr=400&va=200&te=200&step=200", { password: state.pwd });
         const wins = r.windows || [];
         $("#bResult").innerHTML = `<div class="card"><div class="card-head"><h2>Walk-forward windows</h2><span class="sub">${wins.length} windows</span></div>
           ${wins.length ? `<div class="table-wrap"><table class="data"><caption class="sr-only">Walk-forward windows</caption>
@@ -1016,16 +1367,39 @@
   VIEWS.risk = async (root, seq) => {
     root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:160px"></div><div class="skeleton" style="min-height:220px"></div></div>`;
     const [risk, positions, auto] = await Promise.all([
-      safeGet("/api/v2/risk"), safeGet("/api/v2/positions"), safeGet("/api/v2/automate/status"),
+      safeGet("/api/v2/risk"), gatedGet("/api/v2/positions"), safeGet("/api/v2/automate/status"),
     ]);
     if (seq !== viewSeq) return;
+    const acctLocked = authBlocked(positions);
     const r = risk.ok ? risk.value : null;
     const p = positions.ok ? positions.value : null;
     const a = auto.ok ? auto.value : null;
+    const brokerDown = !acctLocked && !!p && !p.available;
     const rows = (p && p.positions) || [];
     const equity = p && p.account ? Number(p.account.equity) : null;
     const exposure = rows.reduce((sum, x) => sum + Math.abs(Number(x.market_value) || 0), 0);
     const exposurePct = isNum(equity) && equity > 0 ? (exposure / equity) * 100 : null;
+
+    const exposureBody = acctLocked
+      ? lockedPanel("Exposure")
+      : brokerDown
+        ? brokerUnavailable("Exposure", p.error)
+        : `<div class="kv"><span class="k">Gross exposure</span><span class="v">${p && p.available ? money(exposure) : "—"}</span></div>
+          <div class="kv"><span class="k">Equity</span><span class="v">${p && p.available ? money(equity) : "—"}</span></div>
+          <div class="kv"><span class="k">Exposure / equity</span><span class="v ${exposurePct && exposurePct > 100 ? "warn" : ""}">${p && p.available ? pctPts(exposurePct) : "—"}</span></div>
+          <div class="kv"><span class="k">Session day P&L</span><span class="v ${r ? tone(r.daily_loss) : ""}">${r ? signedMoney(r.daily_loss) : "—"}</span></div>`;
+
+    const concentrationBody = acctLocked
+      ? lockedPanel("Concentration")
+      : brokerDown
+        ? brokerUnavailable("Concentration", p.error)
+        : rows.length ? `<div class="table-wrap"><table class="data">
+            <caption class="sr-only">Position concentration</caption>
+            <thead><tr><th>Symbol</th><th class="num">Market value</th><th class="num">% equity</th></tr></thead>
+            <tbody>${rows.map((x) => {
+              const pctv = isNum(equity) && equity > 0 ? (Math.abs(Number(x.market_value) || 0) / equity) * 100 : null;
+              return `<tr><td class="sym">${esc(x.symbol)}</td><td class="num">${money(Number(x.market_value))}</td><td class="num ${pctv && pctv > 50 ? "warn" : ""}">${pctH(pctv)}</td></tr>`;
+            }).join("")}</tbody></table></div>` : `<div class="empty">No positions.</div>`;
 
     const limitRows = r ? Object.entries(r.limits || {}).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${isNum(v) ? num(v, 2) : esc(String(v))}</span></div>`).join("") : "";
 
@@ -1035,10 +1409,7 @@
       <section class="grid three">
         <div class="card">
           <div class="card-head"><h2>Exposure</h2><span class="sub">paper account</span></div>
-          <div class="kv"><span class="k">Gross exposure</span><span class="v">${p && p.available ? money(exposure) : "—"}</span></div>
-          <div class="kv"><span class="k">Equity</span><span class="v">${p && p.available ? money(equity) : "—"}</span></div>
-          <div class="kv"><span class="k">Exposure / equity</span><span class="v ${exposurePct && exposurePct > 100 ? "warn" : ""}">${pctPts(exposurePct)}</span></div>
-          <div class="kv"><span class="k">Session day P&L</span><span class="v ${r ? tone(r.daily_loss) : ""}">${r ? signedMoney(r.daily_loss) : "—"}</span></div>
+          ${exposureBody}
         </div>
         <div class="card">
           <div class="card-head"><h2>Limits</h2><span class="sub">enforced server-side</span></div>
@@ -1060,13 +1431,7 @@
       <section class="grid two">
         <div class="card">
           <div class="card-head"><h2>Concentration</h2><span class="sub">by symbol</span></div>
-          ${rows.length ? `<div class="table-wrap"><table class="data">
-            <caption class="sr-only">Position concentration</caption>
-            <thead><tr><th>Symbol</th><th class="num">Market value</th><th class="num">% equity</th></tr></thead>
-            <tbody>${rows.map((x) => {
-              const pctv = isNum(equity) && equity > 0 ? (Math.abs(Number(x.market_value) || 0) / equity) * 100 : null;
-              return `<tr><td class="sym">${esc(x.symbol)}</td><td class="num">${money(Number(x.market_value))}</td><td class="num ${pctv && pctv > 50 ? "warn" : ""}">${pctH(pctv)}</td></tr>`;
-            }).join("")}</tbody></table></div>` : `<div class="empty">No positions.</div>`}
+          ${concentrationBody}
         </div>
         <div class="card">
           <div class="card-head"><h2>Emergency stop</h2><span class="sub">blocks new orders</span></div>
@@ -1086,12 +1451,12 @@
     $("#unlockBtn").addEventListener("click", () => { if (!state.ops) openAuth(); });
 
     $("#killBtn").addEventListener("click", async () => {
-      if (!ensureOps()) return;
+      if (!ensureOps("the kill switch")) return;
       if (!window.confirm("Engage the kill switch? All new orders will be blocked immediately.")) return;
       try {
         await apiPost("/api/kill", { password: state.pwd, reason: "dashboard manual" });
         toast("Kill switch engaged.", "bad");
-        getCache.clear();
+        clearCache();
         render();
       } catch (e) {
         recordError("/api/kill", e);
@@ -1101,13 +1466,14 @@
 
     const autoToggle = $("#autoToggle");
     if (autoToggle) autoToggle.addEventListener("click", async () => {
-      if (!ensureOps()) return;
+      if (!ensureOps("automation")) return;
       const action = a && a.running ? "stop" : "start";
+      if (action === "start" && !window.confirm("Start the paper automation loop? It will place paper orders on its interval.")) return;
       autoToggle.disabled = true;
       try {
         await apiPost(`/api/automate/${action}`, { password: state.pwd });
         toast(`Automation ${action === "start" ? "started" : "stopped"}.`, "ok");
-        getCache.clear();
+        clearCache();
         render();
       } catch (e) {
         recordError(`/api/automate/${action}`, e);
@@ -1123,7 +1489,7 @@
       try {
         const res = await apiPost("/api/automate/run-once", { password: state.pwd });
         toast(`Automation cycle: ${res.result || "done"}`, "ok");
-        getCache.clear();
+        clearCache();
         render();
       } catch (e) {
         recordError("/api/automate/run-once", e);
@@ -1135,16 +1501,19 @@
 
   VIEWS.activity = async (root, seq) => {
     root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:220px"></div></div>`;
-    const [logs] = await Promise.all([safeGet("/api/logs?limit=300", { ttl: 0 })]);
+    const [logs] = await Promise.all([gatedGet("/api/logs?limit=300", { ttl: 0 })]);
     if (seq !== viewSeq) return;
+    const logsLocked = authBlocked(logs);
     const events = logs.ok ? (logs.value.events || []).slice().reverse() : [];
     const bad = events.filter((e) => e.level === "error" || e.level === "critical");
     const warn = events.filter((e) => e.level === "warning");
 
     root.innerHTML = `<div class="stack">
       <div class="card">
-        <div class="card-head"><h2>Server events</h2><span class="sub">${events.length} recent · ${bad.length} errors · ${warn.length} warnings</span></div>
-        ${logs.ok ? (events.length ? `<div class="table-wrap"><table class="data">
+        <div class="card-head"><h2>Server events</h2><span class="sub">${logsLocked ? "locked" : `${events.length} recent · ${bad.length} errors · ${warn.length} warnings`}</span></div>
+        ${logsLocked
+          ? lockedPanel("Server events")
+          : logs.ok ? (events.length ? `<div class="table-wrap"><table class="data">
           <caption class="sr-only">Server log events</caption>
           <thead><tr><th>Time</th><th>Level</th><th>Event</th><th>Detail</th></tr></thead>
           <tbody>${events.map((e) => `<tr>
@@ -1198,7 +1567,8 @@
           <div class="card-head"><h2>Connections</h2><span class="sub">health snapshot</span></div>
           ${h ? healthRows(h) : errorBox("Health", health.error)}
           <div class="kv" style="margin-top:8px"><span class="k">API base</span><span class="v mono small">${esc(API_BASE || "same origin")}</span></div>
-          <div class="kv"><span class="k">Build</span><span class="v mono small">static · v7</span></div>
+          <div class="kv"><span class="k">Browser timezone</span><span class="v mono small">${esc(tzName())}</span></div>
+          <div class="kv"><span class="k">Build</span><span class="v mono small">static · v8</span></div>
         </div>
       </section>
       <section class="grid two">
@@ -1224,8 +1594,12 @@
             <button class="btn" id="setTheme" type="button">Toggle theme</button>
             <button class="btn ghost" id="setLock" type="button">${state.ops ? "Lock controls" : "Unlock controls"}</button>
           </div>
-          <p class="muted small">The dashboard password is held in memory for this tab only. Refreshing or closing the tab clears it. It is never written to localStorage or the build output.</p>
-          <p class="muted small" style="margin-top:8px">Paper trading only. Live trading is disabled in configuration and rejected at startup.</p>
+          ${kvRow("Account data", state.pwd ? "unlocked for this tab" : passwordRequired() ? "locked" : "not required by the server")}
+          ${kvRow("Password storage", "memory only — no localStorage, cookie or URL")}
+          ${kvRow("Values", "broker-reported paper account; simulated only where labelled")}
+          ${authNote() ? `<p class="banner warn" style="margin-top:8px">${esc(authNote())}</p>` : ""}
+          <p class="muted small" style="margin-top:8px">The dashboard password is held in memory for this tab only. Locking clears it and drops cached account reads. Refreshing or closing the tab clears it too. It is never written to localStorage or the build output.</p>
+          <p class="muted small" style="margin-top:8px">Paper trading only. Live trading is disabled in configuration and rejected at startup. Automation never starts on its own.</p>
         </div>
       </section>
     </div>`;
@@ -1241,8 +1615,15 @@
   function lockControls() {
     state.ops = false;
     state.pwd = "";
+    state.authState = passwordRequired() ? "locked" : "unknown";
+    state.authNote = "";
+    state.authToast = "";
+    state.authCooldownUntil = 0;
+    // Authenticated cache entries are dropped with the password so no account
+    // payload can be served back to a locked session.
+    clearCache({ authOnly: true });
     updateLockButton();
-    toast("Trading controls locked.", "ok");
+    toast("Locked. Account data is hidden until you unlock again.", "ok");
     render();
   }
 
@@ -1292,7 +1673,7 @@
 
     $("#themeToggle").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
     $("#btnRefresh").addEventListener("click", async () => {
-      getCache.clear();
+      clearCache();
       await refreshChrome();
       render();
       toast("Refreshed", "ok");
@@ -1304,6 +1685,19 @@
       } else openAuth();
     });
 
+    // Every locked placeholder carries a real Unlock affordance; one delegated
+    // listener keeps it working across re-renders without inline handlers (CSP).
+    document.addEventListener("click", (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest("[data-unlock]") : null;
+      if (!btn) return;
+      e.preventDefault();
+      if (state.config && state.config.password_required === false) {
+        toast("DASHBOARD_PASSWORD is not configured on the server, so there is nothing to unlock.", "warn");
+        return;
+      }
+      openAuth();
+    });
+
     $("#authForm").addEventListener("submit", async (e) => {
       e.preventDefault();
       const pwd = $("#authPwd").value;
@@ -1311,19 +1705,26 @@
       err.hidden = true;
       try {
         await unlock(pwd);
-        getCache.clear();
+        // Load account data immediately with the new credential instead of
+        // waiting for the next poll. unlock() already dropped every cache
+        // entry, so nothing here can serve a pre-unlock payload.
+        await refreshChrome();
         render();
       } catch (ex) {
         recordError("/api/auth", ex);
         err.hidden = false;
-        err.textContent = ex.status === 403 ? "Invalid password." : ex.message;
+        err.textContent = ex.status === 403 ? "Invalid password."
+          : ex.status === 429 ? "Too many attempts. Wait a minute and try again." : ex.message;
       }
     });
     $("#authReadonly").addEventListener("click", () => {
       state.ops = false;
       state.pwd = "";
+      state.authState = passwordRequired() ? "locked" : "unknown";
+      state.authNote = "";
       updateLockButton();
       closeAuth();
+      render();
     });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && !$("#authModal").hidden) closeAuth();
@@ -1332,9 +1733,11 @@
     const cfg = await safeGet("/api/config/validate", { ttl: 0 });
     if (cfg.ok) state.config = cfg.value;
     if (cfg.ok && cfg.value.password_required) {
+      state.authState = "locked";
       openAuth();
     } else {
       state.ops = false;
+      state.authState = "unknown";
       updateLockButton();
     }
     await refreshChrome();

@@ -126,6 +126,9 @@ class Settings:
     # passes a timeout to requests.Session, so without this a hung connection
     # can block an API request thread indefinitely.
     broker_read_timeout: float = 10.0
+    # Interactive API docs (/docs, /redoc, /openapi.json). Disabled by default so
+    # a public deployment does not advertise its endpoint schema to the internet.
+    api_docs_enabled: bool = False
     weights: dict = field(default_factory=lambda: {
         "trend": 1.0, "momentum": 1.0, "mean_reversion": 1.0,
         "volatility": 0.5, "volume_regime": 0.5, "stat_relationship": 0.5})
@@ -192,6 +195,7 @@ def load_settings() -> Settings:
         database_application_name=_s("DB_APPLICATION_NAME", default="finrl-trader"),
         require_durable_store=_b("REQUIRE_DURABLE_STORE", False),
         broker_read_timeout=_f("BROKER_READ_TIMEOUT_SECONDS", 10.0),
+        api_docs_enabled=_b("ENABLE_API_DOCS", False),
     )
 
 

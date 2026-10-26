@@ -254,7 +254,25 @@ table.data .sym { font-weight: 650; }
 .kv:last-child { border-bottom: 0; }
 .kv dt, .kv .k { color: var(--muted); font-size: 11.5px; }
 .kv dd, .kv .v { margin: 0; font-family: var(--mono); font-size: 12px; text-align: right; }
-.badge-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+
+/* Health snapshot: badge + detail per component, text never colour alone. */
+.health-rows { display: flex; flex-direction: column; gap: 1px; }
+.health-row {
+  display: grid; grid-template-columns: 96px 84px minmax(0, 1fr); gap: 8px;
+  align-items: baseline; padding: 5px 0; border-bottom: 1px dashed var(--line);
+}
+.health-row:last-child { border-bottom: 0; }
+.health-row .h-name { color: var(--muted); font-size: 11.5px; }
+.health-row .h-detail { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.health-facts { margin-top: 8px; }
+
+/* Locked account-data placeholder (password gate). */
+.locked {
+  display: flex; flex-direction: column; gap: 8px; padding: 16px;
+  border: 1px dashed color-mix(in srgb, var(--warn) 45%, var(--line));
+  border-radius: var(--radius-sm); background: var(--warn-bg);
+}
+.locked strong { font-size: 13px; }
 
 /* Charts */
 .chart-wrap { position: relative; width: 100%; }
@@ -360,6 +378,8 @@ table.data .sym { font-weight: 650; }
   .alloc-row { grid-template-columns: 70px minmax(0, 1fr) 64px; }
   .topbar-title p { display: none; }
   .topbar-actions .conn { order: 3; }
+  .health-row { grid-template-columns: 1fr auto; }
+  .health-row .h-detail { grid-column: 1 / -1; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }

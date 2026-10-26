@@ -201,3 +201,42 @@
   not ready (invalid config, or required durable store unavailable); `/health`
   and `/healthz` do the same. An engaged kill switch keeps HTTP 200 (body
   `ok=false`, `status=degraded`) so an orchestrator restart cannot clear it.
+
+- **Unauthenticated compute endpoints.** `/api/backtest`, `/api/pipeline/run`
+  and `/api/walkforward` accepted POSTs with no credential and no throttle;
+  `/api/backtest` also wrote a row (`db.save_backtest`). Root cause: the auth
+  sweep covered broker/risk routes only. Fixed: all three call `authed()`
+  (fail-closed, 6/min; walkforward 30/min) and a missing
+  `DASHBOARD_PASSWORD` locks them like every other mutation.
+- **Account data readable without a credential.** With `DASHBOARD_PASSWORD`
+  configured, `/api/v2/summary`, `/api/v2/positions`, `/api/v2/orders`,
+  `/api/v2/signals`, `/api/signals`, `/api/v2/performance`, `/api/logs`,
+  `/api/jobs/{id}` and `POST /api/positions` were still public. Fixed:
+  `read_guard()` requires the `X-Dashboard-Password` header (or a POST body
+  field) for those routes; health, market data, config and sanitized
+  `/api/v2/db` stay public so the platform probe keeps working. The credential
+  is never read from a query string. Installs without a password keep the
+  previous open-read behaviour (documented in DECISIONS.md).
+- **Broker state was invisible to health.** `_health_payload()` had no broker
+  component, so an expired/rejected Alpaca key or an unreachable endpoint looked
+  healthy. `Broker.probe()` now performs a read-only `get_account` through the
+  socket-bounded read path and classifies `ok` / `missing_credentials` /
+  `auth_failed` / `timeout` / `network_error` / `tls_error` / `broker_error`.
+  The probe runs on a daemon thread (3 s first wait, 15 s result TTL) so a hung
+  Alpaca call cannot make the health check time out. It never submits, cancels
+  or modifies an order.
+- **Broker/Redis outages looked like readiness failures.** Readiness (`ready`,
+  HTTP 503) is now limited to invalid config and the required durable store.
+  Broker and Redis outages degrade `ok`/`status` but keep HTTP 200, which avoids
+  restart loops on a recoverable dependency (a restart would also clear the
+  in-memory kill switch).
+- **Redis health did not prove connectivity.** `_redis_component()` used
+  `stats()` (`INFO memory`) instead of `PING`, and `RedisCache.health_check()`
+  returned early when the client was unavailable. Fixed: a real `PING` bounded
+  by the client's 2 s socket timeout plus one rate-limited reconnect, with
+  `backend`/`fallback`/`latency_ms` in the payload.
+- **API schema docs were public.** `/docs`, `/redoc` and `/openapi.json` are now
+  disabled unless `ENABLE_API_DOCS=true`.
+- **Client-facing errors could carry host topology.** Added
+  `public_error()`/`public_text()` (IPv4 + `host=` redaction on top of
+  `safe_msg()`) and applied them to `/api/v2/db`, summary, positions and orders.

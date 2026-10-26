@@ -177,6 +177,28 @@ def safe_msg(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {m[:300]}"
 
 
+# Infrastructure detail that belongs in a server log but not in an HTTP response
+# to an unauthenticated client: IP literals and explicit host name values.
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_HOST_TOKEN_RE = re.compile(r"(?i)\b(?:host|hostaddr|hostname)\s*[=:]\s*[^\s,;'\"\)]+")
+
+
+def public_text(msg: str) -> str:
+    """Redact IP literals and ``host=...`` values from a message string."""
+    m = _IPV4_RE.sub("[redacted-ip]", msg or "")
+    return _HOST_TOKEN_RE.sub("host=[redacted]", m)
+
+
+def public_error(exc: BaseException) -> str:
+    """Sanitized error text safe to return to an unauthenticated API client.
+
+    Builds on :func:`safe_msg` (which strips credentials, tokens and DSN password
+    segments) and additionally removes host/IP topology so a diagnostics endpoint
+    cannot be used to map the internal network.
+    """
+    return public_text(safe_msg(exc))
+
+
 from .session_logger import (  # noqa: E402  (imported after safe_msg to avoid circular import)
     init_errors_dir,
     next_session_id,

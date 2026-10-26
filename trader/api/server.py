@@ -3,6 +3,7 @@ from __future__ import annotations
 """Trader API: health, config, market, pipeline, backtest jobs, guarded orders, risk, automate."""
 
 import os
+import threading
 import time
 import uuid
 from typing import Any
@@ -19,7 +20,7 @@ from pydantic import BaseModel
 from ..ai import Muse
 from ..backtest.bt import run as bt_run, windows
 from ..core.config import load_settings, validate_settings
-from ..core.kit import Auth, check_ops, cid, init_session_logging, log, qty as v_qty, recent, safe_msg, set_cid, shutdown_session_logging, symbol as v_sym
+from ..core.kit import Auth, check_ops, cid, init_session_logging, log, public_error, public_text, qty as v_qty, recent, safe_msg, set_cid, shutdown_session_logging, symbol as v_sym
 from ..data.market import AlpacaProvider, Cache, MarketStore, TF_MS, canon, CcxtProvider
 from ..data.redis_cache import RedisCache
 from ..data.db_store import DBStore
@@ -39,6 +40,7 @@ class BTReq(BaseModel):
     symbol: str = "BTC/USD"
     timeframe: str = "15Min"
     limit: int = 300
+    password: str = ""
 
 
 class OrderReq(BaseModel):
@@ -58,7 +60,15 @@ def create_app():
     config_errors = validate_settings(s)
     if config_errors:
         raise RuntimeError("Invalid trading configuration: " + "; ".join(config_errors))
-    app = FastAPI(title="Trader", version="2.0.0")
+    # Interactive schema docs are opt-in: a public deployment must not advertise
+    # its endpoints. ENABLE_API_DOCS=true restores /docs, /redoc, /openapi.json.
+    _docs = bool(s.api_docs_enabled)
+    app = FastAPI(
+        title="Trader", version="2.0.0",
+        docs_url="/docs" if _docs else None,
+        redoc_url="/redoc" if _docs else None,
+        openapi_url="/openapi.json" if _docs else None,
+    )
     session_id = init_session_logging(BASE_DIR)
     atexit.register(shutdown_session_logging)
     app.add_middleware(CORSMiddleware, allow_origins=list(s.cors_origins) + [
@@ -232,14 +242,53 @@ def create_app():
                 return forwarded.split(",")[-1].strip()[:64] or "unknown"
         return (request.client.host if request.client else "unknown")[:64]
 
-    def authed(pw: str, key: str = "default", request: Request | None = None) -> None:
+    def authed(pw: str, key: str = "default", request: Request | None = None,
+               limit: int = 10, window: float = 60.0) -> None:
         # Rate limit per (client, endpoint) so one client cannot lock out others.
+        # Expensive compute endpoints pass a tighter limit than a plain mutation.
         client = _client_ip(request) if request is not None else "local"
-        if not _rl(f"{key}:{client}"):
+        if not _rl(f"{key}:{client}", limit, window):
             raise HTTPException(429, "Rate limit exceeded. Try again later.")
-        a: Auth = check_ops(pw, s.dashboard_password)
+        # Body first (existing contract); the header is accepted for clients that
+        # cannot easily send a body. A URL query string is never consulted.
+        supplied = pw or (request.headers.get("x-dashboard-password", "")
+                          if request is not None else "")
+        a: Auth = check_ops((supplied or "").strip(), s.dashboard_password)
         if not a.ok:
             raise HTTPException(403, a.reason)
+
+    def _body_pw(req: object) -> str:
+        """Password from a JSON body (never from a URL query string)."""
+        if isinstance(req, dict):
+            v = req.get("password", "")
+            return v if isinstance(v, str) else ""
+        return ""
+
+    # Distinct throttle bucket for failed read credentials: a GET must not
+    # become an unlimited password oracle. Successful reads are cheap and are
+    # not throttled (the dashboard polls several panels per refresh).
+    def read_guard(request: Request, pw: str = "") -> None:
+        """Authorize account-data reads when a dashboard password is configured.
+
+        Market data, health and configuration diagnostics stay public. Portfolio,
+        order, log, signal and performance data are account information, so they
+        require the dashboard credential once one exists. Local/dev installs with
+        no DASHBOARD_PASSWORD stay open (there is no credential to fail closed
+        against) and keep the existing dashboard experience.
+
+        The password is accepted in the ``X-Dashboard-Password`` header (preferred,
+        since GET has no body) or in a POST body field -- never a query string.
+        """
+        if not s.dashboard_password:
+            return
+        client = _client_ip(request)
+        supplied = (request.headers.get("x-dashboard-password") or pw or "").strip()
+        a: Auth = check_ops(supplied, s.dashboard_password)
+        if a.ok:
+            return
+        if not _rl(f"readfail:{client}", limit=12, window=60.0):
+            raise HTTPException(429, "Too many invalid credential attempts.")
+        raise HTTPException(403, a.reason)
 
     def _db_component() -> dict:
         """Report the durable store truthfully.
@@ -263,40 +312,118 @@ def create_app():
                     "durable": True, "latency_ms": store.get("latency_ms")}
         return {"ok": not s.require_durable_store,
                 "detail": "postgres unavailable",
-                "backend": "postgres", "durable": False}
+                "backend": "postgres", "durable": False,
+                "latency_ms": store.get("latency_ms")}
 
     def _redis_component() -> dict:
-        stats = _cached_health("cache_stats", lambda: cache.stats())
-        backend = str(stats.get("backend", "memory"))
-        if backend == "redis":
-            return {"ok": True, "detail": "redis", "configured": True}
-        if s.redis_url:
-            return {"ok": False, "configured": True,
-                    "detail": "redis unavailable; in-process cache active"}
-        return {"ok": True, "configured": False, "detail": "memory (no REDIS_URL)"}
+        """Report the cache layer truthfully.
+
+        A configured Redis is probed with a real PING (bounded by the client's
+        2 s socket timeout, cached for 5 s) instead of being inferred from INFO
+        memory stats: availability must reflect connectivity. When Redis is down
+        the process keeps serving from its in-process cache -- that is a degraded
+        cache, not a readiness failure, so it never causes a restart loop.
+        """
+        hc = _cached_health("redis_ping", cache.health_check)
+        configured = bool(hc.get("configured", bool(s.redis_url)))
+        if hc.get("status") == "ok":
+            return {"ok": True, "configured": True, "detail": "redis",
+                    "backend": "redis", "latency_ms": hc.get("latency_ms"),
+                    "fallback": False}
+        if configured:
+            return {"ok": False, "configured": True, "backend": "memory",
+                    "detail": "redis unavailable; in-process cache active",
+                    "latency_ms": None, "fallback": True,
+                    "error": hc.get("error")}
+        return {"ok": True, "configured": False, "backend": "memory",
+                "detail": "memory (no REDIS_URL)", "latency_ms": None,
+                "fallback": False}
+
+    # Broker probe state: an Alpaca round-trip must never block a health check.
+    # The probe runs on a daemon thread; the first caller waits at most
+    # _PROBE_WAIT seconds for a real answer and later callers reuse a result up
+    # to _PROBE_TTL seconds old. A hung Alpaca endpoint therefore cannot trip an
+    # orchestrator health-check timeout and cause a restart loop.
+    _PROBE_TTL = 15.0
+    _PROBE_WAIT = 3.0
+    _probe_lock = threading.Lock()
+    _probe_state: dict = {"result": None, "at": 0.0, "inflight": False}
+
+    def _run_probe() -> None:
+        try:
+            out = broker.probe()
+        except Exception as exc:  # noqa: BLE001 - health must never crash
+            out = {"paper": True, "endpoint": getattr(broker, "url", ""),
+                   "available": False, "status": "broker_error",
+                   "detail": public_error(exc), "latency_ms": None,
+                   "account_status": None}
+        with _probe_lock:
+            _probe_state["result"] = out
+            _probe_state["at"] = time.time()
+            _probe_state["inflight"] = False
+
+    def _broker_component() -> dict:
+        now = time.time()
+        with _probe_lock:
+            result = _probe_state["result"]
+            fresh = result is not None and now - _probe_state["at"] < _PROBE_TTL
+            inflight = bool(_probe_state["inflight"])
+            if not fresh and not inflight:
+                _probe_state["inflight"] = True
+                inflight = True
+                threading.Thread(target=_run_probe, name="broker-probe",
+                                 daemon=True).start()
+        if result is None and inflight:
+            # Bounded first wait: a healthy probe answers in milliseconds, while
+            # a hung endpoint falls through to "probing" instead of blocking.
+            deadline = time.time() + _PROBE_WAIT
+            while time.time() < deadline:
+                with _probe_lock:
+                    if _probe_state["result"] is not None:
+                        break
+                time.sleep(0.02)
+        with _probe_lock:
+            result = _probe_state["result"]
+            at = _probe_state["at"]
+        if result is None:
+            return {"ok": False, "available": False, "status": "probing",
+                    "detail": "broker probe in progress", "paper": True,
+                    "endpoint": getattr(broker, "url", "")}
+        out = dict(result)
+        out["ok"] = bool(out.get("available"))
+        out["stale_seconds"] = round(max(0.0, time.time() - at), 1)
+        return out
 
     def _health_payload(include_extras: bool = True) -> dict:
         errs = validate_settings(s)
-        dbf, rf = _db_component(), _redis_component()
+        dbf, rf, bf = _db_component(), _redis_component(), _broker_component()
         comps: dict[str, dict] = {
             "config": {"ok": not errs, "detail": "; ".join(errs) or "ok"},
             "risk_kill": {"ok": not risk.killed, "detail": "engaged" if risk.killed else "ok"},
             "db": dbf,
             "redis": rf,
+            "broker": bf,
         }
         if include_extras:
             comps["Muse"] = {"ok": True, "detail": "enabled" if ai.available else "disabled/fail-closed"}
             comps["rl"] = {"ok": True, "detail": _SB3_VERSION}
         # "ready" is the deployment gate (can this instance safely take traffic?):
-        # valid config plus a working durable store when one is required.
-        # "ok" additionally covers state that must not trigger a restart, such as
-        # an engaged kill switch (a restart would clear it).
+        # valid config plus a working durable store when one is required. Broker
+        # and Redis outages are deliberately excluded: they degrade functionality
+        # but must not restart a process (a restart would also clear the kill
+        # switch) and are recoverable without one.
         storage_ready = dbf["ok"] if s.require_durable_store else True
         ready = (not errs) and storage_ready
-        healthy = ready and not risk.killed and not errs
-        return {"ok": (not errs) and (not risk.killed) and dbf["ok"],
-                "ready": ready, "status": "ok" if healthy else "degraded",
-                "mode": s.trading_mode, "components": comps,
+        # "ok" is overall health: a missing/rejected broker credential, a dead
+        # broker endpoint or a Redis outage must not silently appear healthy.
+        ok = (not errs) and (not risk.killed) and dbf["ok"] and rf["ok"] and bf["ok"]
+        return {"ok": ok,
+                "ready": ready, "status": "ok" if ok else "degraded",
+                "mode": s.trading_mode,
+                "storage": {"durable": bool(dbf.get("durable")),
+                            "backend": dbf.get("backend"),
+                            "required": s.require_durable_store},
+                "components": comps,
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     @app.get("/api/health")
@@ -326,7 +453,8 @@ def create_app():
                              "dry_run": s.automate_dry_run, "min_conf": s.automate_min_conf}}
 
     @app.get("/api/logs")
-    def logs(limit: int = 200, level: str = ""):
+    def logs(request: Request, limit: int = 200, level: str = ""):
+        read_guard(request)
         lv = tuple(level.split(",")) if level else ()
         return {"events": recent(min(limit, 1000), lv)}
     @app.get("/api/market/bars")
@@ -341,15 +469,21 @@ def create_app():
             raise HTTPException(502, safe_msg(exc))
 
     @app.post("/api/pipeline/run")
-    def pipe():
+    def pipe(request: Request, req: dict = {}):
+        # Runs the full signal/risk cycle: a state-changing, broker-touching
+        # operation, so it requires the dashboard credential and is rate limited.
+        authed(_body_pw(req), "pipeline", request, limit=6)
         return cycle()
 
     @app.get("/api/signals")
-    def sigs():
+    def sigs(request: Request):
+        read_guard(request)
         return state["signals"]
 
     @app.post("/api/backtest")
-    def bt(req: BTReq):
+    def bt(request: Request, req: BTReq):
+        # Expensive compute that also persists a row: authenticated + throttled.
+        authed(req.password, "backtest", request, limit=6)
         def _job():
             b = store.bars(v_sym(req.symbol), req.timeframe, min(max(1, req.limit), 2000))
             f = features(b)
@@ -384,11 +518,14 @@ def create_app():
         return {"job_id": j.id, "status": j.status}
 
     @app.post("/api/walkforward")
-    def wf(n: int = 1000, tr: int = 400, va: int = 200, te: int = 200, step: int = 200):
+    def wf(request: Request, req: dict = {}, n: int = 1000, tr: int = 400, va: int = 200,
+           te: int = 200, step: int = 200):
+        authed(_body_pw(req), "walkforward", request, limit=30)
         return {"windows": [vars(w) for w in windows(n, tr, va, te, step)]}
 
     @app.get("/api/jobs/{jid}")
-    def job(jid: str):
+    def job(jid: str, request: Request):
+        read_guard(request)
         j = jobs.jobs.get(jid)
         if not j:
             raise HTTPException(404, "unknown job")
@@ -486,11 +623,17 @@ def create_app():
             raise HTTPException(400, safe_msg(exc))
 
     @app.post("/api/positions")
-    def pos(req: dict = {}):
-        # positions is read-only account state; no auth required.
-        # Served through the short-TTL display cache to avoid repeated Alpaca calls.
-        # Degrades honestly when the broker is unreachable (200 + available=false +
-        # error) instead of a 502 that the dashboard would silently show as "Flat".
+    def pos(request: Request, req: dict = {}):
+        # Account state is read-only here (no mutation), but it is account data:
+        # once a dashboard password exists it requires the credential. The
+        # legacy POST accepts the password in the body; GET-style callers use
+        # the X-Dashboard-Password header. Local installs without a password
+        # stay open so the dashboard keeps working unchanged.
+        read_guard(request, _body_pw(req))
+        # Served through the short-TTL display cache to avoid repeated Alpaca
+        # calls, and degrades honestly when the broker is unreachable (200 +
+        # available=false + error) instead of a 502 that the dashboard would
+        # silently render as a flat book.
         def _fetch_positions():
             try:
                 a = broker.account()
@@ -566,7 +709,8 @@ def create_app():
                 "source": s.data_provider}
 
     @app.get("/api/v2/positions")
-    def api_positions():
+    def api_positions(request: Request):
+        read_guard(request)
         def _fetch_v2_positions():
             try:
                 a = broker.account()
@@ -576,13 +720,14 @@ def create_app():
                         "total_unrealized_pl": round(sum(float(p.get("unrealized_pl", 0.0) or 0.0) for p in pos_list), 2),
                         "positions_value": round(sum(float(p.get("market_value", 0.0) or 0.0) for p in pos_list), 2)}
             except Exception as exc:  # noqa: BLE001 - report, never fake a flat book
-                return {"available": False, "error": safe_msg(exc),
+                return {"available": False, "error": public_error(exc),
                         "account": None, "positions": [],
                         "total_unrealized_pl": None, "positions_value": None}
         return _cached_display("v2_positions", _fetch_v2_positions)
 
     @app.get("/api/v2/signals")
-    def api_signals_v2():
+    def api_signals_v2(request: Request):
+        read_guard(request)
         return {"signals": state.get("signals", {}),
                 "count": len(state.get("signals", {}))}
 
@@ -610,12 +755,12 @@ def create_app():
             try:
                 a = broker.account()
             except Exception as exc:  # noqa: BLE001 - credentials may be absent
-                a, err = None, safe_msg(exc)
+                a, err = None, public_error(exc)
             try:
                 pos_list = broker.positions_detail()
             except Exception as exc:  # noqa: BLE001
                 pos_list = []
-                err = err or safe_msg(exc)
+                err = err or public_error(exc)
             if a is None:
                 # Never invent equity/P&L: report the data as unavailable.
                 return {"available": False, "source": "unavailable",
@@ -647,11 +792,13 @@ def create_app():
         return _cached_display("equity_snapshot", _fetch)
 
     @app.get("/api/v2/summary")
-    def api_summary_v2():
+    def api_summary_v2(request: Request):
+        read_guard(request)
         return _equity_snapshot()
 
     @app.get("/api/v2/orders")
-    def api_orders_v2():
+    def api_orders_v2(request: Request):
+        read_guard(request)
         def _fetch():
             open_orders, oerr = broker.get_open_orders()
             hist = [vars(f) for f in list(broker.history)][-100:]
@@ -659,8 +806,9 @@ def create_app():
                 db_open, derr = db.get_open_orders()
             except Exception:  # noqa: BLE001
                 db_open, derr = [], "db open-orders read unavailable"
-            return {"open": open_orders or [], "open_error": oerr,
-                    "history": hist, "db_open": db_open, "db_error": derr,
+            return {"open": open_orders or [], "open_error": public_text(oerr) or None,
+                    "history": hist, "db_open": db_open,
+                    "db_error": public_text(derr) or None,
                     "broker_available": oerr is None,
                     "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         return _cached_display("v2_orders", _fetch)
@@ -737,7 +885,7 @@ def create_app():
                 report.update(db.verify())
             except Exception as exc:  # noqa: BLE001 - never leak a DSN
                 report["ok"] = False
-                report["error"] = safe_msg(exc)
+                report["error"] = public_error(exc)
             stats = db.stats()
             report.update({
                 "backend": stats.get("backend"),
@@ -747,7 +895,9 @@ def create_app():
                 "fallback_memory": bool(stats.get("fallback_memory")),
             })
             if not report.get("error"):
-                report["error"] = stats.get("error")
+                # stats() carries a driver message; scrub host/IP detail before
+                # it is returned to an unauthenticated diagnostics caller.
+                report["error"] = public_text(stats.get("error") or "") or None
             # A single coherent verdict: the schema is valid AND writes are
             # actually persisted durably right now.
             report["ok"] = bool(report.get("ok")) and bool(report["durable"])
@@ -762,7 +912,8 @@ def create_app():
                 "cooling_down": time.time() < ai._cool, "fail_closed": True}
 
     @app.get("/api/v2/performance")
-    def api_performance_v2():
+    def api_performance_v2(request: Request):
+        read_guard(request)
         best = None
         for j in reversed(list(jobs.jobs.values())):
             if j.kind == "backtest" and j.status == "done" and j.result:
@@ -786,6 +937,14 @@ def create_app():
         @app.get("/")
         def index():
             return FileResponse(str(fe / "index.html"))
+
+    # Warm the bounded broker probe at startup so the first health check has a
+    # real answer instead of reporting "probing": a cold TLS handshake to Alpaca
+    # was measured at ~4 s, while warm reads take ~0.3 s.
+    with _probe_lock:
+        _probe_state["inflight"] = True
+    threading.Thread(target=_run_probe, name="broker-probe-warm",
+                     daemon=True).start()
 
     return app
 

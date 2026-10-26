@@ -77,6 +77,43 @@ def _shutdown_pool(pool: ThreadPoolExecutor) -> None:
         pass
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """Best-effort HTTP status code from alpaca-py / requests exceptions."""
+    for attr in ("status_code", "code"):
+        try:
+            v = getattr(exc, attr, None)
+        except Exception:  # noqa: BLE001 - alpaca APIError.code parses JSON
+            v = None
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def classify_broker_error(exc: BaseException) -> tuple[str, str]:
+    """Map a broker exception to ``(status, secret-free detail)``.
+
+    The raw text is used only for matching; the returned detail is a fixed
+    string, so credentials, account identifiers or upstream payloads can never
+    leak through diagnostics.
+    """
+    code = _http_status(exc)
+    raw = f"{type(exc).__name__} {exc}".lower()
+    if code in (401, 403) or "unauthorized" in raw or "forbidden" in raw:
+        return "auth_failed", "Alpaca rejected the paper API credentials (HTTP 401/403)."
+    if "timed out" in raw or "timeout" in raw:
+        return "timeout", "Paper account read timed out."
+    if "ssl" in raw or "certificate" in raw:
+        return "tls_error", "TLS verification failed for the Alpaca paper API."
+    if any(k in raw for k in ("connection", "name resolution", "getaddrinfo",
+                              "refused", "unreachable", "resolve")):
+        return "network_error", "Cannot reach the Alpaca paper API."
+    if code is not None:
+        return "broker_error", f"Alpaca paper API returned HTTP {code}."
+    return "broker_error", f"Paper account read failed ({type(exc).__name__})."
+
+
 @dataclass
 class Fill:
     cid: str
@@ -205,6 +242,42 @@ class Broker:
                 "day_pnl": equity - float(last_equity),
                 "status": str(getattr(a.status, "value", a.status)),
                 "pdt": bool(getattr(a, "pattern_day_trader", False))}
+
+    def probe(self) -> dict:
+        """Bounded, READ-ONLY connectivity + credential probe for the paper account.
+
+        Never submits, cancels, replaces or modifies an order: it reads the
+        account through the same socket-bounded read path as ``account()``. The
+        result separates missing credentials, rejected credentials, timeouts,
+        TLS and network faults so callers can report an unavailable broker
+        honestly instead of a fabricated zero balance. No secret material is
+        ever included in the returned document.
+        """
+        base: dict = {"paper": True, "endpoint": self.url, "available": False,
+                      "status": "unknown", "detail": "", "latency_ms": None,
+                      "account_status": None}
+        if not self._key or not self._secret:
+            base.update(status="missing_credentials",
+                        detail="Alpaca paper API credentials are not configured.")
+            return base
+        start = time.perf_counter()
+        try:
+            a = self._read("probe_account", lambda: self._c().get_account())
+        except (TimeoutError, FuturesTimeout):
+            base.update(status="timeout",
+                        detail=f"Paper account read exceeded {self._read_timeout:.1f}s.",
+                        latency_ms=round((time.perf_counter() - start) * 1000.0, 1))
+            return base
+        except Exception as exc:  # noqa: BLE001 - classified, never re-raised
+            status, detail = classify_broker_error(exc)
+            base.update(status=status, detail=detail,
+                        latency_ms=round((time.perf_counter() - start) * 1000.0, 1))
+            return base
+        acct = getattr(getattr(a, "status", None), "value", getattr(a, "status", None))
+        base.update(available=True, status="ok", account_status=str(acct or "unknown"),
+                    detail="Paper account reachable.",
+                    latency_ms=round((time.perf_counter() - start) * 1000.0, 1))
+        return base
 
     def positions(self) -> dict[str, float]:
         rows = self._read("positions", lambda: self._c().get_all_positions())
