@@ -4,6 +4,8 @@ Yahoo Finance API
 
 from __future__ import annotations
 
+import inspect
+
 import pandas as pd
 import yfinance as yf
 
@@ -47,14 +49,18 @@ class YahooDownloader:
         # Download and save the data in a pandas DataFrame:
         data_df = pd.DataFrame()
         num_failures = 0
+        # yfinance >= 1.7.0 removed the `proxy` keyword from `yf.download()`.
+        # Keep the public `proxy` argument, but forward it only when the
+        # installed yfinance still accepts it (backward compatible).
+        _download_kwargs = {
+            "start": self.start_date,
+            "end": self.end_date,
+            "auto_adjust": auto_adjust,
+        }
+        if "proxy" in inspect.signature(yf.download).parameters:
+            _download_kwargs["proxy"] = proxy
         for tic in self.ticker_list:
-            temp_df = yf.download(
-                tic,
-                start=self.start_date,
-                end=self.end_date,
-                proxy=proxy,
-                auto_adjust=auto_adjust,
-            )
+            temp_df = yf.download(tic, **_download_kwargs)
             if temp_df.columns.nlevels != 1:
                 temp_df.columns = temp_df.columns.droplevel(1)
             temp_df["tic"] = tic

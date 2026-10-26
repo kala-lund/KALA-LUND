@@ -66,6 +66,7 @@ def trade(
             turbulence_thresh=30,
             max_stock=1e2,
             latency=None,
+            order_gate=kwargs.get("legacy_order_gate"),
         )
 
         # AlpacaPaperTrading.run()  # run paper trading

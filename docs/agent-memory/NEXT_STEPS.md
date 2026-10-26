@@ -78,3 +78,31 @@ Open engineering items (not started):
 - [ ] Replace the upstream hardcoded Shioaji / FRED demo keys with env lookups
       and rotate them (they are public in upstream FinRL since 2023).
 - [ ] Upstream `unit_tests` are not part of CI yet (full FinRL dependency set).
+
+## Neon + dashboard migration (2026-10-26) - code done, deploy pending
+
+Completed locally (no commit/push/deploy):
+- Neon pooled `DATABASE_URL` active with `sslmode=require`; `REQUIRE_DURABLE_STORE=true`.
+- `scripts/db_migrate.py` applied/verified schema v1 (4 tables, 0 rows).
+- `DBStore` SSL/retry/verify/row-count support; `/api/v2/db` + `/api/v2/health`.
+- Dashboard rebuilt (8 views, themes, SVG charts, honest unavailable states).
+- Cloudflare `_headers`, `_redirects`, frontend asset tests.
+- Docs: `.env.example`, `railway.toml`, `docs/DEPLOYMENT_RAILWAY.md`,
+  `docs/DEPLOYMENT_NEON.md`.
+
+Owner actions, in order (all require explicit approval; none were executed):
+1. [ ] Review `git diff` and run the full verification block from TEST_HISTORY
+       (trader tests, unit_tests, frontend build, API smoke, Docker build).
+2. [ ] Railway -> Variables: set `DATABASE_URL` to the Neon **pooled** DSN with
+       `?sslmode=require`; keep `REQUIRE_DURABLE_STORE=true`; set `CORS_ORIGINS`
+       to the exact Pages origin, `TRUST_PROXY_HEADERS=true`, and a strong
+       `DASHBOARD_PASSWORD`.
+3. [ ] Deploy backend; verify `/api/v2/health` -> `components.db.ok=true` and
+       `/api/v2/db` -> `schema_ok=true`, `version=1`.
+4. [ ] Rebuild Pages with `API_BASE_URL=https://<railway-origin> npm run build:pages`
+       and deploy `dist/`.
+5. [ ] Rotate the Neon role password if any DSN was ever pasted into chat/logs;
+       update the Railway variable afterwards.
+6. [ ] Only after a successful deploy: consider a Neon restore-point/branch
+       backup and a Railway Infrastructure-as-Code migration (config-as-code is
+       deprecated 2026-12-01).

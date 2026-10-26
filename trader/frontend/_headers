@@ -1,0 +1,28 @@
+# Cloudflare Pages security headers (trader/frontend/_headers)
+#
+# The dashboard is a static bundle: no inline scripts, no third-party runtime
+# code. Inline *style attributes* are generated for chart geometry, so
+# style-src keeps 'unsafe-inline'; scripts do not.
+#
+# connect-src includes https: because the Pages bundle may be pointed at a
+# separately hosted API (set API_BASE_URL in config.js). Tighten this to your
+# exact API origin once it is fixed, e.g.:
+#   connect-src 'self' https://kala-lund-api.up.railway.app
+#
+# If you change the CSP, update trader/tests/test_frontend_assets.py too.
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
+  Cross-Origin-Opener-Policy: same-origin
+  X-Permitted-Cross-Domain-Policies: none
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
+
+# Hashed/versioned asset references (?v=N) allow aggressive caching.
+/static/*
+  Cache-Control: public, max-age=86400
+
+/config.js
+  Cache-Control: no-cache

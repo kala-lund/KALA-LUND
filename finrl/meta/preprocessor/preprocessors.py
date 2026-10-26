@@ -166,8 +166,12 @@ class FeatureEngineer:
             df = self.add_user_defined_feature(df)
             print("Successfully added user defined features")
 
-        # fill the missing values at the beginning and the end
-        df = df.ffill().bfill()
+        # fill the missing values at the end using only past observations.
+        # NOTE: bfill() is intentionally NOT used here, because it would pull
+        # future observations into the past (look-ahead bias). Leading NaNs
+        # (e.g. indicator warm-up) are left as missing values rather than being
+        # fabricated from future data.
+        df = df.ffill()
         return df
 
     def clean_data(self, data):

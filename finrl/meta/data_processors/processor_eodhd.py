@@ -399,8 +399,11 @@ class EodhdProcessor:
             print(f"Filling Missing Rows for tic {tic}")
 
             cols_to_ffill = ["close", "open", "high", "low", "volume"]
+            # Forward-fill only: carry each ticker's last known price forward.
+            # NOTE: bfill() is intentionally NOT used, because it would pull
+            # future prices into past dates (look-ahead bias).
             df.loc[df["tic"] == tic, cols_to_ffill] = (
-                df.loc[df["tic"] == tic, cols_to_ffill].ffill().bfill()
+                df.loc[df["tic"] == tic, cols_to_ffill].ffill()
             )
 
         return df

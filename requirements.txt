@@ -56,3 +56,16 @@ wrds
 
 # market data & paper trading API
 yfinance
+
+# Trader V2 API dependencies (explicitly declared; previously missing)
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.5
+anthropic>=0.30
+python-dotenv>=1.0
+
+# Redis (fast caching for market data, signals)
+redis>=5.0
+
+# PostgreSQL (Neon; Supabase kept as rollback) for persistent storage
+psycopg2-binary>=2.9

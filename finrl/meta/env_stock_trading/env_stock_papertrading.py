@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import threading
 import time
+from typing import Callable, Optional
 
 import alpaca_trade_api as tradeapi
 import gymnasium as gym
@@ -10,6 +11,11 @@ import numpy as np
 import pandas as pd
 import torch
 
+from ..paper_trading.safety import (
+    PaperExecutionSafetyError,
+    require_paper_configuration,
+    verify_paper_order_submission,
+)
 from finrl.meta.data_processors.processor_alpaca import AlpacaProcessor
 
 
@@ -31,7 +37,16 @@ class AlpacaPaperTrading:
         turbulence_thresh=30,
         max_stock=1e2,
         latency=None,
+        trading_environment="paper",
+        order_gate: Optional[Callable[[float, str, str], bool]] = None,
     ):
+        self._api_key = API_KEY
+        self._api_secret = API_SECRET
+        self._execution_endpoint = require_paper_configuration(
+            API_KEY, API_SECRET, API_BASE_URL, trading_environment
+        )
+        self._broker_environment = trading_environment
+        self._order_gate = order_gate
         # load agent
         self.drl_lib = drl_lib
         if agent == "ppo":
@@ -99,7 +114,10 @@ class AlpacaPaperTrading:
         # connect to Alpaca trading API
         try:
             self.alpaca = tradeapi.REST(API_KEY, API_SECRET, API_BASE_URL, "v2")
-        except:
+            self._verify_order_submission()
+        except PaperExecutionSafetyError:
+            raise
+        except Exception:
             raise ValueError(
                 "Fail to connect Alpaca. Please check account info and internet connection."
             )
@@ -139,6 +157,25 @@ class AlpacaPaperTrading:
         self.stockUniverse = ticker_list
         self.turbulence_bool = 0
         self.equities = []
+
+    def _verify_order_submission(self):
+        """Re-verify paper endpoint, environment, credentials, and account status."""
+        return verify_paper_order_submission(
+            self.alpaca,
+            self._api_key,
+            self._api_secret,
+            self._execution_endpoint,
+            self._broker_environment,
+        )
+
+    def _legacy_order_approved(self, qty, stock, side):
+        """Require an explicit caller-supplied risk approval for legacy orders."""
+        if self._order_gate is None:
+            return False
+        try:
+            return bool(self._order_gate(qty, stock, side))
+        except Exception:
+            return False
 
     def test_latency(self, test_times=10):
         total_time = 0
@@ -339,6 +376,10 @@ class AlpacaPaperTrading:
     def submitOrder(self, qty, stock, side, resp):
         if qty > 0:
             try:
+                if not self._legacy_order_approved(qty, stock, side):
+                    resp.append(False)
+                    return
+                self._verify_order_submission()
                 self.alpaca.submit_order(stock, qty, side, "market", "day")
                 print(
                     "Market order of | "
@@ -350,7 +391,7 @@ class AlpacaPaperTrading:
                     + " | completed."
                 )
                 resp.append(True)
-            except:
+            except Exception:
                 print(
                     "Order of | "
                     + str(qty)

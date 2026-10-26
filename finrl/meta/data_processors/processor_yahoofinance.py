@@ -504,7 +504,12 @@ class YahooFinanceProcessor:
 
         # Align dates across all tickers to prevent shape mismatch in np.hstack
         df = df.set_index(["date", "tic"]).unstack(level=1)
-        df = df.ffill().bfill()
+        # Forward-fill only: carry each ticker's last known price forward.
+        # NOTE: bfill() is intentionally NOT used, because it would pull future
+        # prices into past dates (look-ahead bias). Leading NaNs (a ticker that
+        # starts trading later) are left missing rather than fabricated from the
+        # future.
+        df = df.ffill()
         df = df.stack(level=1, dropna=False).reset_index()
         df = df.sort_values(by=["date", "tic"]).reset_index(drop=True)
 

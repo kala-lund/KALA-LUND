@@ -44,6 +44,12 @@ def test_config_aliases_and_guards(monkeypatch):
     assert any("endpoint" in e.lower() for e in validate_settings(load_settings()))
 
 
+def test_config_rejects_cors_wildcard(monkeypatch):
+    monkeypatch.setenv("CORS_ORIGINS", "*")
+    errors = validate_settings(load_settings())
+    assert any("CORS_ORIGINS" in e and "*" in e for e in errors)
+
+
 def test_canon_and_validation():
     assert canon("BTCUSD") == "BTC/USD" and canon("ETH/BTC") == "ETH/BTC"
     assert v_sym("btc/usd") == "BTC/USD"

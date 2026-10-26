@@ -46,6 +46,26 @@ def test_safe_msg_redacts_secrets():
     assert "redacted" not in safe_msg(ValueError("plain error message"))
 
 
+def test_safe_msg_redacts_dsn_without_keyword_hint():
+    msg = safe_msg(ValueError("invalid dsn: postgresql://user:hunter2@db.example.com:5432/x"))
+    assert "hunter2" not in msg
+    assert "user:" not in msg
+    assert "[redacted]" in msg
+
+
+def test_xff_spoofing_does_not_bypass_rate_limit(monkeypatch):
+    """X-Forwarded-For is ignored unless TRUST_PROXY_HEADERS is enabled."""
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw")
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "false")
+    c = TestClient(create_app(), raise_server_exceptions=False)
+    codes = set()
+    for i in range(25):
+        rr = c.post("/api/auth", json={"password": "wrong"},
+                    headers={"X-Forwarded-For": f"203.0.113.{i}"})
+        codes.add(rr.status_code)
+    assert 429 in codes, f"spoofed XFF bypassed the limit; codes={codes}"
+
+
 def test_check_ops_rejects_empty_and_wrong():
     assert not check_ops("", "pw").ok
     assert not check_ops("wrong", "pw").ok

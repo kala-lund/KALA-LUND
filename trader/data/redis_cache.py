@@ -31,7 +31,7 @@ class RedisCache:
     """
 
     def __init__(self, max_entries: int = 1000, ttl: int = 300,
-                 redis_url: str = "") -> None:
+                 redis_url: str = "", reconnect_cooldown: float = 30.0) -> None:
         self.max_entries = max_entries
         self.ttl = ttl
         self.redis_url = redis_url
@@ -39,6 +39,11 @@ class RedisCache:
         self._local: "OrderedDict[str, CacheEntry]" = OrderedDict()
         self._lock = threading.Lock()
         self._redis_available = False
+        # A dropped Redis must be recoverable: instead of disabling Redis for the
+        # whole process lifetime, a reconnect is attempted (rate-limited) on the
+        # next cache operation once this cooldown has elapsed.
+        self._reconnect_cooldown = max(0.0, float(reconnect_cooldown))
+        self._last_reconnect_attempt = 0.0
         self._init_redis()
 
     def _init_redis(self) -> None:
@@ -46,12 +51,38 @@ class RedisCache:
             return
         try:
             import redis  # type: ignore
-            self._client = redis.Redis.from_url(
+            client = redis.Redis.from_url(
                 self.redis_url, decode_responses=True, socket_timeout=2,
                 socket_connect_timeout=2)
-            self._client.ping()
+            client.ping()
+            self._client = client
             self._redis_available = True
         except Exception:  # noqa: BLE001 - Redis optional, fall back to local
+            self._client = None
+            self._redis_available = False
+        self._last_reconnect_attempt = time.time()
+
+    def _maybe_reconnect(self) -> None:
+        """Attempt a reconnect at most once per cooldown window.
+
+        Never raises; keeps Redis disabled (and the local cache authoritative)
+        until a ping succeeds. No URL or credential is logged.
+        """
+        if self._redis_available or not self.redis_url:
+            return
+        now = time.time()
+        if now - self._last_reconnect_attempt < self._reconnect_cooldown:
+            return
+        self._last_reconnect_attempt = now
+        try:
+            import redis  # type: ignore
+            client = redis.Redis.from_url(
+                self.redis_url, decode_responses=True, socket_timeout=2,
+                socket_connect_timeout=2)
+            client.ping()
+            self._client = client
+            self._redis_available = True
+        except Exception:  # noqa: BLE001 - stay on the local cache
             self._client = None
             self._redis_available = False
 
@@ -93,6 +124,8 @@ class RedisCache:
         return f"qtrade:{k}"
 
     def get(self, k: str) -> Any:
+        if not self._redis_available:
+            self._maybe_reconnect()
         if self._redis_available and self._client is not None:
             try:
                 raw = self._client.get(self._key(k))
@@ -111,6 +144,8 @@ class RedisCache:
 
     def put(self, k: str, v: Any, ttl: int | None = None) -> None:
         ttl = ttl if ttl is not None else self.ttl
+        if not self._redis_available:
+            self._maybe_reconnect()
         if self._redis_available and self._client is not None:
             try:
                 self._client.set(
@@ -127,6 +162,8 @@ class RedisCache:
                 self._local.popitem(last=False)
 
     def delete(self, k: str) -> None:
+        if not self._redis_available:
+            self._maybe_reconnect()
         if self._redis_available and self._client is not None:
             try:
                 self._client.delete(self._key(k))

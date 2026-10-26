@@ -222,3 +222,4 @@ docs/architecture-v2.11.9/
 *.pkl
 *.pth
 *.npy
+.neon

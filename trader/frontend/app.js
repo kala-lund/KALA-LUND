@@ -1,385 +1,1342 @@
-/* Trader V2 — Professional dark paper-trading command center. Same-origin API. */
-const TABS = ["Overview", "Market", "Signals", "Positions", "Backtest", "Risk", "Settings"];
-const ICONS = { Overview: "📊", Market: "📈", Signals: "🎯", Positions: "💼", Backtest: "⏱", Risk: "🛡", Settings: "⚙" };
-let cur = localStorage.getItem("tab") || "Overview";
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => Array.from(document.querySelectorAll(s));
-let sessionOk = sessionStorage.getItem("authed") === "1";
-let savedPwd = sessionStorage.getItem("authedPwd") || "";
-let refreshTimer = null;
+/* KALA-LUND paper-trading terminal.
+ * Vanilla ES2020 + SVG charts. No build step, no third-party runtime code.
+ * All values shown come from the backend; missing data renders as "—".
+ */
+(() => {
+  "use strict";
 
-const toast = (m, kind = "") => {
-  const d = document.createElement("div");
-  d.className = "toast" + (kind ? " " + kind : "");
-  d.textContent = String(m).slice(0, 400);
-  $("#toasts").appendChild(d);
-  setTimeout(() => d.remove(), 8000);
-};
+  const API_BASE = String(window.API_BASE_URL || window.FINRL_API_BASE_URL || "").replace(/\/+$/, "");
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const money = (x, dec = 2) => { const n = Number(x); if (!Number.isFinite(n)) return "—"; return (n >= 0 ? "+" : "") + n.toFixed(dec); };
-const pct = (x) => { const n = Number(x); if (!Number.isFinite(n)) return "—%"; return (n >= 0 ? "+" : "") + n.toFixed(2) + "%"; };
+  const TABS = [
+    { id: "overview", label: "Overview", icon: "◫", sub: "Portfolio, risk and system state" },
+    { id: "portfolio", label: "Portfolio", icon: "◈", sub: "Holdings, allocation, orders and fills" },
+    { id: "markets", label: "Markets", icon: "⌁", sub: "Watchlist quotes and candlestick chart" },
+    { id: "strategies", label: "Strategies", icon: "⌁", sub: "Signal aggregation and Muse status" },
+    { id: "backtest", label: "Backtest", icon: "◷", sub: "Equity curve, drawdown, benchmark, walk-forward" },
+    { id: "risk", label: "Risk", icon: "⛨", sub: "Limits, exposure and emergency stop" },
+    { id: "activity", label: "Activity", icon: "▤", sub: "Server events and browser errors" },
+    { id: "settings", label: "Settings", icon: "⚙", sub: "Safe configuration and connection details" },
+  ];
 
-async function api(path, opts = {}) {
-  const base = window.API_BASE_URL || window.FINRL_API_BASE_URL || "";
-  const r = await fetch(base + path, opts);
-  const t = await r.text();
-  let j; try { j = JSON.parse(t); } catch { j = { detail: t }; }
-  if (!r.ok) {
-    const d = j.detail !== undefined ? j.detail : t.slice(0, 300);
-    const m = (j.code ? `[${j.code}] ` : `[${r.status}] `) + (typeof d === "string" ? d : JSON.stringify(d).slice(0, 400));
-    toast(m);
-    throw new Error(m);
-  }
-  return j;
-}
-
-async function apiSafe(path, opts = {}) {
-  try { return await api(path, opts); } catch (e) { return { _error: String(e.message) }; }
-}
-
-function candles(canvas, bars) {
-  const c = canvas.getContext("2d");
-  const W = canvas.width = canvas.clientWidth * 2, H = canvas.height = 300;
-  c.fillStyle = "#0b0c11"; c.fillRect(0, 0, W, H);
-  if (!bars || !bars.length) { c.fillStyle = "#8b949e"; c.font = "24px sans-serif"; c.fillText("No data", 22, 40); return; }
-  const hi = Math.max(...bars.map(b => b.h)), lo = Math.min(...bars.map(b => b.l));
-  const Y = (p) => H - 26 - ((p - lo) / ((hi - lo) || 1)) * (H - 60);
-  const cw = W / bars.length;
-  bars.forEach((b, i) => {
-    const up = b.c >= b.o;
-    c.strokeStyle = c.fillStyle = up ? "#3fb950" : "#f85149";
-    c.beginPath(); c.moveTo(i * cw + cw / 2, Y(b.h)); c.lineTo(i * cw + cw / 2, Y(b.l)); c.stroke();
-    const y1 = Y(Math.max(b.o, b.c)), y2 = Y(Math.min(b.o, b.c));
-    c.fillRect(i * cw + 1, y1, cw - 2, Math.max(2, y2 - y1));
-  });
-}
-
-function lineChart(canvas, xs) {
-  const c = canvas.getContext("2d");
-  const W = canvas.width = canvas.clientWidth * 2, H = canvas.height = 240;
-  c.fillStyle = "#0b0c11"; c.fillRect(0, 0, W, H);
-  if (!xs || !xs.length) { c.fillStyle = "#8b949e"; c.font = "22px sans-serif"; c.fillText("No data", 20, 30); return; }
-  const hi = Math.max(...xs), lo = Math.min(...xs);
-  c.strokeStyle = "#2f81f7"; c.lineWidth = 3; c.beginPath();
-  xs.forEach((e, i) => {
-    const x = (i / Math.max(1, xs.length - 1)) * (W - 20) + 10;
-    const y = H - 24 - ((e - lo) / ((hi - lo) || 1)) * (H - 44);
-    i ? c.lineTo(x, y) : c.moveTo(x, y);
-  });
-  c.stroke();
-}
-
-function pill(cls, txt) { return `<span class="pill2 ${cls}">${esc(txt)}</span>`; }
-
-const PAGES = {};
-
-PAGES.Overview = async (el) => {
-  const [s, cfg, summ, auto] = await Promise.allSettled([
-    apiSafe("/api/health"), apiSafe("/api/config/validate"), apiSafe("/api/v2/summary"), apiSafe("/api/v2/automate/status")
-  ]);
-  const h = s.status === "fulfilled" ? s.value : {};
-  const c = cfg.status === "fulfilled" ? cfg.value : {};
-  const sm = summ.status === "fulfilled" ? summ.value : {};
-  const aa = auto.status === "fulfilled" ? auto.value : {};
-  const up = (h.components && h.components.risk_kill) ? (h.components.risk_kill.ok ? "OK" : "ENGAGED") : "—";
-  const live = !!c.live;
-  el.innerHTML = `
-  <div class="grid4">
-    <div class="stat"><div class="s-label">Mode</div><div class="s-val">${esc(c.trading_mode || "paper")}</div><div class="s-cap">${live ? '<span class="pill2 bad">LIVE</span>' : '<span class="pill2 ok">PAPER</span>'}</div></div>
-    <div class="stat"><div class="s-label">Account Equity</div><div class="s-val">$${sm.equity !== undefined ? money(sm.equity) : "—"}</div><div class="s-cap">${sm.status ? `broker: ${esc(sm.status)}` : "paper account"}</div></div>
-    <div class="stat"><div class="s-label">Daily P&L</div><div class="s-val ${sm.day_pnl >= 0 ? 'ok' : 'bad'}">${money(sm.day_pnl)}</div><div class="s-cap">session P&L</div></div>
-    <div class="stat"><div class="s-label">Unrealized P&L</div><div class="s-val ${sm.unrealized_pl >= 0 ? 'ok' : 'bad'}">${money(sm.unrealized_pl)}</div><div class="s-cap">open positions</div></div>
-    <div class="stat"><div class="s-label">Drawdown</div><div class="s-val bad">${money(sm.drawdown_pct)}%</div><div class="s-cap">from peak $${money(sm.peak)}</div></div>
-    <div class="stat"><div class="s-label">Buying Power</div><div class="s-val">$${sm.buying_power !== undefined ? money(sm.buying_power) : "—"}</div><div class="s-cap">available capital</div></div>
-    <div class="stat"><div class="s-label">Kill Switch</div><div class="s-val ${up === "ENGAGED" ? 'bad' : 'ok'}">${up}</div><div class="s-cap">risk engine</div></div>
-    <div class="stat"><div class="s-label">Positions</div><div class="s-val">${sm.positions !== undefined ? sm.positions : "—"}</div><div class="s-cap">open</div></div>
-  </div>
-  <div class="grid3">
-    <div class="card"><h3>Automation</h3>
-      <div class="kv"><span class="k">Status</span><b class="${aa.running ? 'ok' : 'mut'}">${aa.running ? "RUNNING" : "OFF"}</b></div>
-      <div class="kv"><span class="k">Cycle</span><b>${aa.minutes ? aa.minutes + " min" : "—"}</b></div>
-      <div class="kv"><span class="k">Mode</span><b>${aa.dry_run ? "DRY-RUN" : "PAPER LIVE"}</b></div>
-      <div class="kv"><span class="k">Runs</span><b>${aa.runs ?? "0"}</b></div>
-      <div class="kv"><span class="k">Orders (live/dry)</span><b>${aa.live_orders ?? 0} / ${aa.dry_orders ?? 0}</b></div>
-      <div class="actions" style="margin-top:8px;">
-        <button class="btn" id="autostart">${aa.running ? "Stop" : "Start"}</button>
-        <button class="btn secondary" id="autorun">Run Once</button>
-      </div>
-      <div class="muted" id="automsg" style="margin-top:6px;">${esc(aa.last_result || "")}</div>
-    </div>
-    <div class="card"><h3>Configuration</h3>
-      ${Object.entries({
-        "Trading mode": c.trading_mode,
-        "Symbols": c.n_symbols,
-        "Timeframe": c.timeframe,
-        "Paper orders": c.paper_orders ? "ON" : "OFF",
-        "Live trading": c.live ? "ON (blocked)" : "OFF",
-        "Take-profit": (c.take_profit_pct !== undefined ? c.take_profit_pct : sm.take_profit_pct !== undefined ? sm.take_profit_pct : 0) + "%",
-        "Min confidence": aa.automate_min_conf ?? c.automate?.min_conf ?? "—"
-      }).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}
-      <p class="mut" style="margin-top:8px;">Secrets in .env, never shown. Live trading disabled by design.</p>
-    </div>
-    <div class="card"><h3>System Health</h3>
-      ${h.components ? Object.entries(h.components).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><b class="${v.ok ? 'ok' : 'bad'}">${v.ok ? "ok" : "FAIL"}</b> <span class="mut">${esc(v.detail || "")}</span></div>`).join("") : `<div class="empty">Health unavailable</div>`}
-      <div class="mut" style="margin-top:6px;">${h.ts ? "updated " + esc(h.ts) : ""}</div>
-    </div>
-  </div>`;
-  const autostartBtn = el.querySelector("#autostart");
-  if (autostartBtn) {
-    autostartBtn.onclick = async () => {
-      try {
-        const r = await api("/api/automate/" + (aa.running ? "stop" : "start"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: savedPwd }) });
-        aa.running = !aa.running;
-        autostartBtn.textContent = aa.running ? "Stop" : "Start";
-        el.querySelector("#automsg").textContent = (r.result || "").slice(0, 200) || "updated";
-      } catch (e) { toast(e.message); }
-    };
-  }
-  const autorunBtn = el.querySelector("#autorun");
-  if (autorunBtn) {
-    autorunBtn.onclick = async () => {
-      try {
-        const r = await api("/api/automate/run-once", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: savedPwd }) });
-        el.querySelector("#automsg").textContent = (r.result || "").slice(0, 200) || "ran";
-      } catch (e) { toast(e.message); }
-    };
-  }
-};
-
-PAGES.Market = async (el) => {
-  const cfg = await apiSafe("/api/config/validate");
-  const syms = (cfg.status === "fulfilled" && cfg.value && cfg.value.symbols) ? cfg.value.symbols : ["BTC/USD", "ETH/USD", "SOL/USD"];
-  el.innerHTML = `
-  <div class="toolbar"><label>Symbol</label> <select id="mSym">${syms.map(s => `<option>${esc(s)}</option>`).join("")}</select>
-    <button class="btn" id="mGo">Load</button> <span class="mut" id="mInfo">—</span></div>
-  <div class="chart-wrap"><canvas class="chart" id="mCh"></canvas></div>
-  <div class="mut" id="mNote" style="margin-top:6px;">Candlestick data from configured provider; quality flags shown above.</div>`;
-  const go = async () => {
-    const s = el.querySelector("#mSym").value;
-    el.querySelector("#mInfo").textContent = "loading…";
-    try {
-      const tf = (cfg.status === "fulfilled" && cfg.value) ? cfg.value.timeframe : "15Min";
-      const d = await api(`/api/market/bars?symbol=${encodeURIComponent(s)}&timeframe=${encodeURIComponent(tf)}&limit=120`);
-      el.querySelector("#mInfo").textContent = d.quality.ok ? `${d.quality.rows} rows` : "QUALITY: " + d.quality.issues.join("; ");
-      candles(el.querySelector("#mCh"), d.bars);
-      if (!d.quality.ok) toast("Stale or incomplete market data for " + esc(s), "warn");
-    } catch (e) { el.querySelector("#mInfo").textContent = "Error: " + e.message; toast(e.message); }
+  const state = {
+    view: "overview",
+    config: null,
+    health: null,
+    db: null,
+    pwd: "",
+    ops: false,
+    theme: localStorage.getItem("kl-theme") || "dark",
+    lastJob: null,
+    jobPoll: null,
+    errors: [],
+    updatedAt: null,
   };
-  el.querySelector("#mGo").onclick = go;
-  go();
-};
 
-PAGES.Signals = async (el) => {
-  const s = await apiSafe("/api/signals"), muse = await apiSafe("/api/v2/muse");
-  const sigs = s.status === "fulfilled" ? s.value : {};
-  const keys = Object.keys(sigs || {});
-  const mu = muse.status === "fulfilled" ? muse.value : {};
-  el.innerHTML = `
-  <div class="card"><h3>Muse AI Decision Status</h3>
-    <div class="kv"><span class="k">Configured</span><b>${mu.enabled ? "yes" : "no"}</b></div>
-    <div class="kv"><span class="k">Available</span><b class="${mu.available ? 'ok' : 'bad'}">${mu.available ? "yes" : "no"}</b></div>
-    <div class="kv"><span class="k">Model</span><b>${esc(mu.model || "—")}</b></div>
-    <div class="kv"><span class="k">Mode</span><b>fail-closed</b></div>
-    <div class="kv"><span class="k">Failures</span><b>${mu.failures !== undefined ? mu.failures : "—"}</b> <span class="k">Last error</span><b class="bad">${esc(mu.last_error || "—")}</b></div>
-    <div class="mut" style="margin-top:6px;">Muse is decision-support only, not a trading authority. Unavailable decisions are shown as ABSTAIN; no orders are placed automatically.</div>
-  </div>
-  <div class="card"><h3>Strategy Signals (${keys.length})</h3>
-    ${keys.length ? keys.map(k => {
-      const v = sigs[k] || {};
-      const a = v.aggregate || { action: "ABSTAIN", score: 0, conf: 0, reason: "no data" };
-      const cls = a.action === "BUY" ? "ok" : (a.action === "SELL" ? "bad" : "mut");
-      return `<div class="card sig-card" style="margin:0;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-          <div class="sig-sym" style="font-weight:700;">${esc(k)}</div><div class="sig-act ${cls}">${a.action}</div>
-        </div>
-        <div class="kv"><span class="k">Score</span><b>${a.score}</b><span class="k">Conf</span><b>${a.conf}</b><span class="k">Disagree</span><b>${a.disagree ?? "—"}</b></div>
-        <div class="muted sig-reason">${esc(a.reason || "")}</div>
-        <table style="margin-top:6px;"><tr><th>Strategy</th><th>Sig</th><th>Conf</th><th>Reason</th></tr>
-        ${(v.signals || []).map((x) => `<tr><td>${esc(x.name || "?")}</td><td>${x.signal ?? "?"}</td><td>${x.confidence ?? "?"}</td><td class="mut">${esc(x.reason || "")}</td></tr>`).join("")}</table>
-      </div>`;
-    }).join("") : `<div class="empty">No signals yet. Run the pipeline from Overview.</div>`}
-  </div>`;
-};
+  let viewSeq = 0;
+  let pollTimer = null;
+  const getCache = new Map();
+  const inflight = new Map();
+  const FETCH_TIMEOUT = 20000;
 
-PAGES.Positions = async (el) => {
-  const pos = await apiSafe("/api/positions", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-  const orders = await apiSafe("/api/v2/orders");
-  const summ = await apiSafe("/api/v2/summary");
-  const p = pos.status === "fulfilled" ? pos.value : {};
-  const plist = p.positions || [];
-  const eq = p.account ? p.account.equity : 0;
-  const tu = p.total_unrealized_pl ?? 0;
-  const tup = p.total_unrealized_pl_pct ?? 0;
-  const tp = (summ.status === "fulfilled" && summ.value) ? summ.value.take_profit_pct : 0;
-  const o = orders.status === "fulfilled" ? orders.value : {};
-  const openOrders = o.open || [];
-  const hist = o.history || [];
-  el.innerHTML = `
-  <div class="card"><h3>Paper Account</h3>
-    <div class="kv"><span class="k">Equity</span><b>$${eq.toFixed(2)}</b><span class="k">Buying Power</span><b>$${p.account ? p.account.bp.toFixed(2) : "—"}</b></div>
-    <div class="kv"><span class="k">Status</span><b>${p.account ? p.account.status : "—"}</b><span class="k">${tu >= 0 ? "Unrealized P&L" : "Unrealized P&L"}</span><b class="${tu >= 0 ? 'ok' : 'bad'}">$${tu.toFixed(2)} (${tup.toFixed(2)}%)</b></div>
-    <div class="mut" style="margin-top:6px;">Take-profit threshold: ${tp}% (configurable). Per-position exit status shown below.</div>
-  </div>
-  <div class="card"><h3>Open Positions (${plist.length})</h3>
-    ${plist.length ? `<table><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Notional</th><th>Cost</th><th>P&L</th><th>%</th><th>Exit vs TP</th></tr>
-    ${plist.map((x) => {
-      const up = Number(x.unrealized_pl || 0);
-      const cost = Number(x.cost_basis || 0);
-      const tpReach = cost > 0 && tp > 0 ? ((up / cost) * 100).toFixed(2) + "% of " + tp + "%" : "—";
-      return `<tr><td>${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>${Number(x.qty).toFixed(4)}</td><td>$${Number(x.current_price).toFixed(2)}</td><td>$${Number(x.market_value).toFixed(2)}</td><td>$${cost.toFixed(2)}</td><td class="${up >= 0 ? 'ok' : 'bad'}">$${up.toFixed(2)}</td><td class="${up >= 0 ? 'ok' : 'bad'}">${Number(x.unrealized_pl_pct).toFixed(2)}%</td><td class="mut">${tpReach}</td></tr>`;
-    }).join("")}</table>` : `<p class="mut">Flat — no open positions.</p>`}</div>
-  <div class="card"><h3>Pending / Open Orders (${openOrders.length})</h3>
-    ${openOrders.length ? `<table><tr><th>Symbol</th><th>Side</th><th>Notional</th><th>Qty</th><th>Status</th><th>Client Order ID</th></tr>
-    ${openOrders.map((x) => `<tr><td>${esc(x.symbol)}</td><td>${esc(x.side)}</td><td>$${Number(x.notional || 0).toFixed(2)}</td><td>${Number(x.qty || 0).toFixed(4)}</td><td class="mut">${esc(x.status)}</td><td class="mut">${esc(x.client_order_id || "—")}</td></tr>`).join("")}</table>
-    <p class="mut">${o.open_error ? "Broker open-orders note: " + esc(o.open_error) : "Queried live from broker."}</p>` : `<p class="mut">No open orders.</p>`}</div>
-  <div class="card"><h3>Execution History (fills, last 50)</h3>
-    ${hist.length ? `<table><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Client Order ID</th><th>Note</th></tr>
-    ${hist.slice().reverse().map((x) => `<tr><td class="mut">${esc(String(x.ts || "—")).slice(0,16)}</td><td>${esc(x.symbol || "—")}</td><td>${esc(x.side || "—")}</td><td>${Number(x.qty || 0).toFixed(4)}</td><td class="${x.status === "filled" ? 'ok' : (x.status === "rejected" ? 'bad' : 'mut')}">${esc(x.status || "—")}</td><td class="mut">${esc(x.cid || x.client_order_id || "—")}</td><td class="mut">${esc(x.note || "")}</td></tr>`).join("")}</table>` : `<p class="mut">No executions recorded this session.</p>`}</div>`;
-};
+  /* ---------------- formatting ---------------- */
+  const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  function num(v, dec = 2) {
+    if (!isNum(v)) return "—";
+    return v.toLocaleString(undefined, { minimumFractionDigits: dec, maximumFractionDigits: dec });
+  }
+  function money(v, dec = 2) {
+    if (!isNum(v)) return "—";
+    return (v < 0 ? "-" : "") + "$" + Math.abs(v).toLocaleString(undefined, {
+      minimumFractionDigits: dec, maximumFractionDigits: dec,
+    });
+  }
+  function signedMoney(v, dec = 2) {
+    if (!isNum(v)) return "—";
+    return (v > 0 ? "+" : "") + money(v, dec);
+  }
+  function pctPts(v, dec = 2) {
+    if (!isNum(v)) return "—";
+    return (v > 0 ? "+" : "") + v.toFixed(dec) + "%";
+  }
+  function pctFrac(v, dec = 2) {
+    if (!isNum(v)) return "—";
+    return pctPts(v * 100, dec);
+  }
+  function qty(v) {
+    if (!isNum(v)) return "—";
+    return v.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  }
+  function tone(v) {
+    if (!isNum(v) || v === 0) return "";
+    return v > 0 ? "ok" : "bad";
+  }
+  function fmtTs(ts) {
+    if (!isNum(ts) || ts <= 0) return "—";
+    const d = new Date(ts);
+    return d.toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
+  function timeAgo(ts) {
+    if (!isNum(ts) || ts <= 0) return "—";
+    const s = Math.max(0, (Date.now() - ts) / 1000);
+    if (s < 60) return `${Math.round(s)}s ago`;
+    if (s < 3600) return `${Math.round(s / 60)}m ago`;
+    if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+    return `${Math.round(s / 86400)}d ago`;
+  }
+  function shortTime(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
 
-PAGES.Backtest = async (el) => {
-  el.innerHTML = `
-  <div class="toolbar"><select id="bSym"><option>BTC/USD</option><option>ETH/USD</option><option>SOL/USD</option></select>
-    <button class="btn" id="bGo">Run</button> <span class="mut" id="bInfo">—</span></div>
-  <div class="chart-wrap"><canvas class="chart" id="bCh"></canvas></div>
-  <div class="card"><h3>Metrics</h3><pre id="bMet">—</pre></div>
-  <div class="mut" id="bAssumptions" style="margin-top:6px;"></div>`;
-  const go = async () => {
+  /* ---------------- errors / toasts ---------------- */
+  function recordError(where, err) {
+    state.errors.push({ ts: Date.now(), where, msg: String((err && err.message) || err).slice(0, 300) });
+    if (state.errors.length > 60) state.errors.shift();
+  }
+
+  function toast(message, kind = "") {
+    const host = $("#toasts");
+    if (!host) return;
+    const el = document.createElement("div");
+    el.className = "toast " + kind;
+    el.textContent = String(message).slice(0, 400);
+    host.appendChild(el);
+    setTimeout(() => el.remove(), 7000);
+  }
+
+  function apiError(message, status = 0, code = "") {
+    const e = new Error(message);
+    e.status = status;
+    e.code = code;
+    return e;
+  }
+
+  /* ---------------- HTTP ---------------- */
+  async function rawRequest(path, opts = {}) {
+    const method = (opts.method || "GET").toUpperCase();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeout || FETCH_TIMEOUT);
+    let res;
+    let text = "";
     try {
-      const j = await api("/api/backtest", { method: "POST", body: JSON.stringify({ symbol: el.querySelector("#bSym").value }) });
-      el.querySelector("#bInfo").textContent = "job " + j.job_id + " — running…";
-      for (let i = 0; i < 40; i++) {
-        await new Promise(r => setTimeout(r, 1500));
-        const st = await api("/api/jobs/" + j.job_id);
-        if (st.status === "done") {
-          lineChart(el.querySelector("#bCh"), st.result.curve || []);
-          el.querySelector("#bMet").textContent = JSON.stringify(st.result.metrics, null, 1);
-          el.querySelector("#bAssumptions").textContent = "Assumptions: fee " + (st.result.assumptions && st.result.assumptions.fee_pct !== undefined ? st.result.assumptions.fee_pct : "—") + ", slippage " + (st.result.assumptions && st.result.assumptions.slippage_pct !== undefined ? st.result.assumptions.slippage_pct : "—");
-          el.querySelector("#bInfo").textContent = "done";
+      res = await fetch(API_BASE + path, {
+        method,
+        headers: opts.body !== undefined ? { "Content-Type": "application/json" } : undefined,
+        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        signal: ctrl.signal,
+        cache: "no-store",
+      });
+      text = await res.text();
+    } catch (e) {
+      clearTimeout(timer);
+      if (e && e.name === "AbortError") throw apiError(`Request timed out after ${(opts.timeout || FETCH_TIMEOUT) / 1000}s`);
+      throw apiError(`Network error: ${String((e && e.message) || e)}`);
+    }
+    clearTimeout(timer);
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch { body = { detail: text }; }
+    if (!res.ok) {
+      const detail = body && body.detail !== undefined ? body.detail : text;
+      const msg = (body && body.code ? `[${body.code}] ` : `[${res.status}] `) +
+        (typeof detail === "string" ? detail : JSON.stringify(detail).slice(0, 400));
+      throw apiError(msg, res.status, (body && body.code) || "");
+    }
+    return body;
+  }
+
+  async function apiGet(path, { ttl = 5000, force = false, timeout = FETCH_TIMEOUT } = {}) {
+    const hit = getCache.get(path);
+    if (!force && hit && Date.now() - hit.t < ttl) return hit.v;
+    if (inflight.has(path)) return inflight.get(path);
+    const run = (async () => {
+      let lastErr;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const value = await rawRequest(path, { timeout });
+          getCache.set(path, { t: Date.now(), v: value });
+          return value;
+        } catch (e) {
+          lastErr = e;
+          const retryable = !e.status || e.status >= 500;
+          if (!retryable || attempt === 1) break;
+          await new Promise((r) => setTimeout(r, 400));
+        }
+      }
+      throw lastErr;
+    })().finally(() => inflight.delete(path));
+    inflight.set(path, run);
+    return run;
+  }
+
+  async function apiPost(path, body, { timeout = 30000 } = {}) {
+    // Mutations are never retried blindly: a duplicate POST could place an order twice.
+    return rawRequest(path, { method: "POST", body, timeout });
+  }
+
+  async function safeGet(path, opts) {
+    try {
+      return { ok: true, value: await apiGet(path, opts) };
+    } catch (e) {
+      recordError(path, e);
+      return { ok: false, error: e };
+    }
+  }
+
+  /* ---------------- chart renderers ---------------- */
+  function emptyChart(text = "No data", height = 200) {
+    return `<div class="empty" style="min-height:${height}px">${esc(text)}</div>`;
+  }
+
+  function lineChart({ series, height = 220, yFormat = (v) => num(v, 0), ariaLabel = "Line chart" }) {
+    const usable = series.filter((s) => s.values.some(isNum));
+    const all = usable.flatMap((s) => s.values).filter(isNum);
+    if (!all.length) return emptyChart("No series data", height);
+    const W = 760;
+    const H = height;
+    const P = { l: 58, r: 14, t: 12, b: 24 };
+    let min = Math.min(...all);
+    let max = Math.max(...all);
+    if (min === max) { min -= 1; max += 1; }
+    const pad = (max - min) * 0.08;
+    min -= pad; max += pad;
+    const len = Math.max(...usable.map((s) => s.values.length));
+    const X = (i) => P.l + (len <= 1 ? 0 : (i / (len - 1)) * (W - P.l - P.r));
+    const Y = (v) => P.t + (1 - ((v - min) / (max - min))) * (H - P.t - P.b);
+    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(ariaLabel)}" preserveAspectRatio="none"><title>${esc(ariaLabel)}</title>`;
+    for (let k = 0; k <= 3; k++) {
+      const v = min + ((max - min) * k) / 3;
+      const y = Y(v).toFixed(2);
+      svg += `<line class="grid-line" x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}"></line>`;
+      svg += `<text x="4" y="${(Number(y) + 3).toFixed(2)}">${esc(yFormat(v))}</text>`;
+    }
+    usable.forEach((s) => {
+      let d = "";
+      let pen = false;
+      s.values.forEach((v, i) => {
+        if (!isNum(v)) { pen = false; return; }
+        d += `${pen ? "L" : "M"}${X(i).toFixed(2)},${Y(v).toFixed(2)} `;
+        pen = true;
+      });
+      if (s.fill && d) {
+        const base = Y(Math.max(min, 0)).toFixed(2);
+        const area = `${d}L${X(s.values.length - 1).toFixed(2)},${base} L${X(0).toFixed(2)},${base} Z`;
+        svg += `<path class="area" d="${area}" fill="${s.color}"></path>`;
+      }
+      if (d) {
+        svg += `<path class="${s.dash ? "bench" : "line"}" d="${d}" stroke="${s.color}"></path>`;
+      }
+    });
+    svg += `<line class="axis" x1="${P.l}" y1="${H - P.b}" x2="${W - P.r}" y2="${H - P.b}"></line>`;
+    if (usable[0]) {
+      for (let i = 0; i < usable[0].values.length; i += Math.max(1, Math.floor(len / 5))) {
+        const v = usable[0].values[i];
+        if (!isNum(v)) continue;
+        svg += `<text x="${X(i).toFixed(2)}" y="${H - 6}" text-anchor="middle">${i + 1}</text>`;
+      }
+    }
+    svg += "</svg>";
+    return svg;
+  }
+
+  function drawdownSeries(values) {
+    const out = [];
+    let peak = 0;
+    values.forEach((v) => {
+      if (!isNum(v) || v <= 0) { out.push(null); return; }
+      peak = Math.max(peak, v);
+      out.push(peak > 0 ? -((peak - v) / peak) * 100 : 0);
+    });
+    return out;
+  }
+
+  function candleChart(bars, ariaLabel) {
+    const valid = (bars || []).filter((b) => b && isNum(b.o) && isNum(b.h) && isNum(b.l) && isNum(b.c));
+    if (!valid.length) return emptyChart("No candles", 240);
+    const W = 760, H = 260, P = { l: 8, r: 58, t: 12, b: 22 };
+    let hi = Math.max(...valid.map((b) => b.h));
+    let lo = Math.min(...valid.map((b) => b.l));
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const pad = (hi - lo) * 0.05;
+    hi += pad; lo -= pad;
+    const Y = (p) => P.t + (1 - (p - lo) / (hi - lo)) * (H - P.t - P.b);
+    const cw = (W - P.l - P.r) / valid.length;
+    const bw = Math.max(1, cw * 0.62);
+    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(ariaLabel)}" preserveAspectRatio="none"><title>${esc(ariaLabel)}</title>`;
+    for (let k = 0; k <= 4; k++) {
+      const v = lo + ((hi - lo) * k) / 4;
+      const y = Y(v).toFixed(2);
+      svg += `<line class="grid-line" x1="${P.l}" y1="${y}" x2="${W - P.r}" y2="${y}"></line>`;
+      svg += `<text x="${W - P.r + 4}" y="${(Number(y) + 3).toFixed(2)}">${esc(lo > 0 ? v.toFixed(v < 10 ? 4 : 2) : v.toFixed(2))}</text>`;
+    }
+    valid.forEach((b, i) => {
+      const x = P.l + i * cw + cw / 2;
+      const up = b.c >= b.o;
+      const color = up ? "var(--ok)" : "var(--bad)";
+      svg += `<line x1="${x.toFixed(2)}" y1="${Y(b.h).toFixed(2)}" x2="${x.toFixed(2)}" y2="${Y(b.l).toFixed(2)}" stroke="${color}" stroke-width="1"></line>`;
+      const y1 = Y(Math.max(b.o, b.c));
+      const y2 = Y(Math.min(b.o, b.c));
+      svg += `<rect x="${(x - bw / 2).toFixed(2)}" y="${y1.toFixed(2)}" width="${bw.toFixed(2)}" height="${Math.max(1, y2 - y1).toFixed(2)}" fill="${color}"></rect>`;
+    });
+    svg += "</svg>";
+    return svg;
+  }
+
+  function allocationBlock(items) {
+    if (!items.length) return `<div class="empty">No positions. Allocation appears when the paper account holds assets.</div>`;
+    return `<div class="alloc">${items.map((it) => `
+      <div class="alloc-row">
+        <span class="sym" title="${esc(it.symbol)}">${esc(it.symbol)}</span>
+        <span class="alloc-track"><span class="alloc-fill" style="width:${Math.max(0, Math.min(100, it.pct)).toFixed(2)}%"></span></span>
+        <span class="num">${it.pct.toFixed(1)}%</span>
+      </div>`).join("")}</div>`;
+  }
+
+  function kpi(label, value, sub, kind = "", missing = false) {
+    return `<div class="kpi card ${kind}">
+      <div class="k-label">${esc(label)}</div>
+      <div class="k-value ${missing ? "is-missing" : ""}">${esc(value)}</div>
+      <div class="k-sub">${esc(sub || "")}</div>
+    </div>`;
+  }
+
+  function errorBox(what, error) {
+    return `<div class="error-state"><strong>${esc(what)} unavailable</strong><span>${esc(error && error.message ? error.message : error)}</span></div>`;
+  }
+
+  function banner(kind, text) {
+    return `<div class="banner ${kind}">${esc(text)}</div>`;
+  }
+
+  function cmpClass(v, invert = false) {
+    if (!isNum(v) || v === 0) return "";
+    const good = invert ? v < 0 : v > 0;
+    return good ? "ok" : "bad";
+  }
+
+  /* ---------------- shared fragments ---------------- */
+  function healthRows(health) {
+    if (!health || !health.components) return `<div class="empty">Health unavailable.</div>`;
+    return Object.entries(health.components).map(([name, c]) => {
+      const dot = c.ok ? "ok" : (c.configured === false ? "warn" : "bad");
+      return `<div class="kv"><span class="k">${esc(name)}</span><span class="v"><i class="badge-dot" style="background:var(--${dot === "ok" ? "ok" : dot === "warn" ? "warn" : "bad"})"></i>${esc(c.detail || (c.ok ? "ok" : "fail"))}</span></div>`;
+    }).join("");
+  }
+
+  function quoteRow(q) {
+    if (!q.available) {
+      return `<tr><td class="sym">${esc(q.symbol)}</td><td colspan="4" class="muted">Unavailable — ${esc(q.error || "no data")}</td></tr>`;
+    }
+    const ql = q.quality || {};
+    const quality = ql.ok ? `<span class="pill ok">fresh</span>` : `<span class="pill warn" title="${esc((ql.issues || []).join("; "))}">stale</span>`;
+    return `<tr>
+      <td class="sym">${esc(q.symbol)}</td>
+      <td class="num">${money(q.last, q.last < 10 ? 4 : 2)}</td>
+      <td class="num ${cmpClass(q.change)}">${signedMoney(q.change, q.last < 10 ? 4 : 2)}</td>
+      <td class="num ${cmpClass(q.change_pct)}">${pctPts(q.change_pct)}</td>
+      <td>${quality}</td>
+    </tr>`;
+  }
+
+  /* ---------------- auth ---------------- */
+  function openAuth() {
+    const modal = $("#authModal");
+    if (!modal) return;
+    modal.hidden = false;
+    const app = $(".app");
+    if (app) app.inert = true;
+    const input = $("#authPwd");
+    if (input) { input.value = ""; setTimeout(() => input.focus(), 30); }
+    $("#authErr").hidden = true;
+  }
+
+  function closeAuth() {
+    const modal = $("#authModal");
+    if (modal) modal.hidden = true;
+    const app = $(".app");
+    if (app) app.inert = false;
+  }
+
+  async function unlock(password) {
+    const res = await apiPost("/api/auth", { password });
+    state.pwd = password;
+    state.ops = true;
+    closeAuth();
+    updateLockButton();
+    toast("Controls unlocked for this tab.", "ok");
+    return res;
+  }
+
+  function ensureOps() {
+    if (state.ops) return true;
+    if (state.config && state.config.password_required === false) {
+      toast("Trading controls are locked: DASHBOARD_PASSWORD is not configured on the server.", "warn");
+      return false;
+    }
+    toast("Unlock the dashboard to use trading controls.", "warn");
+    openAuth();
+    return false;
+  }
+
+  function updateLockButton() {
+    const b = $("#btnLock");
+    if (!b) return;
+    b.textContent = state.ops ? "Lock" : "Unlock";
+    b.setAttribute("aria-pressed", state.ops ? "true" : "false");
+  }
+
+  /* ---------------- chrome ---------------- */
+  function buildNav() {
+    const nav = $("#nav");
+    if (!nav) return;
+    nav.innerHTML = TABS.map((t) => `
+      <button type="button" data-tab="${t.id}" aria-current="${state.view === t.id ? "page" : "false"}">
+        <span class="nav-ico" aria-hidden="true">${t.icon}</span><span>${esc(t.label)}</span>
+      </button>`).join("");
+    $$("button[data-tab]", nav).forEach((b) => {
+      b.addEventListener("click", () => {
+        if (state.view === b.dataset.tab) return;
+        state.view = b.dataset.tab;
+        localStorage.setItem("kl-view", state.view);
+        render();
+      });
+    });
+  }
+
+  function setTheme(theme) {
+    state.theme = theme === "light" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", state.theme);
+    localStorage.setItem("kl-theme", state.theme);
+    const btn = $("#themeToggle");
+    if (btn) {
+      btn.setAttribute("aria-pressed", state.theme === "dark" ? "true" : "false");
+      const label = $("#themeLabel");
+      if (label) label.textContent = state.theme === "dark" ? "Dark" : "Light";
+    }
+  }
+
+  function setDot(id, status, title) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const dot = $(".dot", el);
+    if (dot) dot.className = "dot " + (status || "");
+    if (title) el.title = title;
+  }
+
+  function updateChrome(health, config) {
+    const h = health || state.health;
+    const cfg = config || state.config;
+    const ok = !!(h && h.ok);
+    const conn = $("#conn");
+    if (conn) {
+      const dot = $(".dot", conn);
+      if (dot) dot.className = "dot " + (h ? (ok ? "ok" : "warn") : "bad");
+      const label = $("span:last-child", conn);
+      if (label) label.textContent = h ? (ok ? "Live" : "Degraded") : "Offline";
+    }
+    if (h) {
+      setDot("miniApi", ok ? "ok" : "bad", h.ts || "");
+      const dbc = h.components && h.components.db;
+      setDot("miniDb", dbc ? (dbc.ok ? "ok" : "bad") : "", dbc ? dbc.detail : "");
+      const rc = h.components && h.components.redis;
+      setDot("miniRedis", rc ? (rc.ok ? "ok" : (rc.configured ? "warn" : "")) : "", rc ? rc.detail : "");
+    }
+    if (cfg) {
+      $("#statusMode").textContent = `mode ${cfg.trading_mode || "—"} · live ${cfg.live ? "ON" : "off"}`;
+      $("#statusSymbols").textContent = `symbols ${cfg.n_symbols ?? "—"}`;
+      $("#statusTimeframe").textContent = `timeframe ${cfg.timeframe || "—"}`;
+    }
+    $("#statusUpdated").textContent = `updated ${state.updatedAt ? shortTime(state.updatedAt) : "—"}`;
+    $("#statusDb").textContent = h && h.components && h.components.db ? `db ${h.components.db.detail}` : "db —";
+  }
+
+  async function refreshChrome() {
+    const [h, cfg] = await Promise.all([
+      safeGet("/api/health", { ttl: 8000 }),
+      safeGet("/api/config/validate", { ttl: 30000 }),
+    ]);
+    if (h.ok) state.health = h.value;
+    if (cfg.ok) state.config = cfg.value;
+    updateChrome(h.ok ? h.value : null, cfg.ok ? cfg.value : null);
+  }
+
+  /* ---------------- views ---------------- */
+  const VIEWS = {};
+
+  VIEWS.overview = async (root, seq) => {
+    root.innerHTML = `<div class="stack">
+      <div class="skeleton" style="min-height:90px"></div>
+      <div class="skeleton" style="min-height:120px"></div>
+      <div class="skeleton" style="min-height:220px"></div>
+    </div>`;
+    const [health, cfg, summary, positions, perf, auto, quotes, db] = await Promise.all([
+      safeGet("/api/health"), safeGet("/api/config/validate"), safeGet("/api/v2/summary"),
+      safeGet("/api/v2/positions"), safeGet("/api/v2/performance"), safeGet("/api/v2/automate/status"),
+      safeGet("/api/v2/quotes"), safeGet("/api/v2/db"),
+    ]);
+    if (seq !== viewSeq) return;
+    if (health.ok) state.health = health.value;
+    if (cfg.ok) state.config = cfg.value;
+    if (db.ok) state.db = db.value;
+    updateChrome(health.ok ? health.value : null, cfg.ok ? cfg.value : null);
+
+    const s = summary.ok ? summary.value : null;
+    const available = !!(s && s.available);
+    const dbv = db.ok ? db.value : {};
+    const dbOk = dbv.configured ? dbv.ok : true;
+
+    const kpis = available
+      ? [
+        kpi("Equity", money(s.equity), s.status || "paper account", "ok"),
+        kpi("Cash", money(s.cash), "settled cash"),
+        kpi("Buying power", money(s.buying_power), "available margin"),
+        kpi("Day P&L", signedMoney(s.day_pnl), "broker session", tone(s.day_pnl)),
+        kpi("Unrealized P&L", signedMoney(s.unrealized_pl), `${s.positions} position(s)`, tone(s.unrealized_pl)),
+        kpi("Drawdown", pctPts(-Math.abs(s.drawdown_pct || 0)), `peak ${money(s.peak)}`, (s.drawdown_pct || 0) > 0 ? "warn" : ""),
+      ].join("")
+      : [
+        kpi("Equity", "—", "broker unavailable", "", true),
+        kpi("Cash", "—", "broker unavailable", "", true),
+        kpi("Buying power", "—", "broker unavailable", "", true),
+        kpi("Day P&L", "—", "broker unavailable", "", true),
+        kpi("Unrealized P&L", "—", "broker unavailable", "", true),
+        kpi("Drawdown", "—", "broker unavailable", "", true),
+      ].join("");
+
+    let alert = "";
+    if (!summary.ok) alert = banner("bad", `Account summary unavailable: ${summary.error.message}`);
+    else if (!available) alert = banner("warn", `Paper broker account not readable (${s.error || "no credentials"}). Values are shown as unavailable, never as zero.`);
+
+    // Equity / benchmark from the most recent completed backtest.
+    let perfCard;
+    if (!perf.ok) {
+      perfCard = errorBox("Performance", perf.error);
+    } else if (perf.value.source === "none") {
+      perfCard = `<div class="empty"><strong>No backtest yet</strong><span>${esc(perf.value.message || "Run one from the Backtest tab.")}</span></div>`;
+    } else {
+      const p = perf.value;
+      const curve = p.curve || [];
+      const bench = p.benchmark || [];
+      perfCard = `<div class="chart-wrap">${lineChart({
+        series: [
+          { values: curve, color: "var(--accent)", fill: true },
+          { values: bench, color: "var(--faint)", dash: true },
+        ],
+        yFormat: (v) => money(v, 0),
+        ariaLabel: `Equity curve for ${p.symbol || "backtest"}`,
+      })}</div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>Strategy</span><span><i style="background:var(--faint)"></i>Buy &amp; hold</span></div>
+      <div class="metric-list" style="margin-top:10px;">
+        <div class="metric"><div class="k">Total return</div><div class="v ${tone(p.metrics && p.metrics.total_return)}">${pctFrac(p.metrics && p.metrics.total_return)}</div></div>
+        <div class="metric"><div class="k">Sharpe</div><div class="v">${num(p.metrics && p.metrics.sharpe, 2)}</div></div>
+        <div class="metric"><div class="k">Max drawdown</div><div class="v bad">${pctFrac(-Math.abs((p.metrics && p.metrics.max_dd) || 0))}</div></div>
+        <div class="metric"><div class="k">Trades</div><div class="v">${num(p.metrics && p.metrics.trades, 0)}</div></div>
+      </div>`;
+    }
+
+    // Allocation from real positions only.
+    let alloc = `<div class="empty">Allocation unavailable.</div>`;
+    if (positions.ok && positions.value.available && positions.value.positions.length) {
+      const rows = positions.value.positions;
+      const total = rows.reduce((a, p) => a + Math.abs(Number(p.market_value) || 0), 0);
+      alloc = allocationBlock(rows.map((p) => ({
+        symbol: p.symbol,
+        pct: total > 0 ? (Math.abs(Number(p.market_value) || 0) / total) * 100 : 0,
+      })).sort((a, b) => b.pct - a.pct));
+    } else if (positions.ok) {
+      alloc = `<div class="empty">Flat book — no allocation to display.</div>`;
+    }
+
+    const quoteTable = quotes.ok
+      ? (quotes.value.quotes.length
+        ? `<div class="table-wrap"><table class="data"><caption class="sr-only">Watchlist quotes</caption>
+            <thead><tr><th>Symbol</th><th class="num">Last</th><th class="num">Change</th><th class="num">%</th><th>Quality</th></tr></thead>
+            <tbody>${quotes.value.quotes.map(quoteRow).join("")}</tbody></table></div>
+          <p class="muted small" style="margin-top:6px">As of ${esc(quotes.value.as_of || "—")} · ${esc(quotes.value.timeframe || "")}</p>`
+        : `<div class="empty">No configured symbols.</div>`)
+      : errorBox("Watchlist", quotes.error);
+
+    const autoV = auto.ok ? auto.value : null;
+    root.innerHTML = `<div class="stack">
+      ${alert}
+      <section class="grid kpis" aria-label="Account metrics">${kpis}</section>
+      <section class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>Equity &amp; benchmark</h2><span class="sub">${esc((perf.ok && perf.value.symbol) || "latest backtest")}</span></div>
+          ${perfCard}
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Allocation</h2><span class="sub">by market value</span></div>
+          ${alloc}
+          <div class="kv" style="margin-top:10px"><span class="k">Exposure</span><span class="v">${available ? pctPts(s.exposure_pct) + " of equity" : "—"}</span></div>
+          <div class="kv"><span class="k">Positions</span><span class="v">${available ? s.positions : "—"}</span></div>
+        </div>
+      </section>
+      <section class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>Watchlist</h2><span class="sub">${esc((cfg.ok && cfg.value.n_symbols) || "")} symbols</span></div>
+          ${quoteTable}
+        </div>
+        <div class="stack">
+          <div class="card">
+            <div class="card-head"><h2>System health</h2><span class="sub">${esc((health.ok && health.value.ts) || "offline")}</span></div>
+            ${health.ok ? healthRows(health.value) : errorBox("Health", health.error)}
+            <div class="kv" style="margin-top:8px"><span class="k">Durable store</span><span class="v ${dbOk ? "ok" : "bad"}">${dbv.configured ? (dbv.ok ? `schema v${dbv.schema_version} · ${dbv.counts ? dbv.counts.orders + dbv.counts.signals + dbv.counts.backtests : 0} rows` : "verification failed") : "not configured"}</span></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Automation</h2><span class="pill ${autoV && autoV.running ? "ok" : "mut"}">${autoV && autoV.running ? "running" : "off"}</span></div>
+            ${autoV ? `
+              <div class="kv"><span class="k">Cycle</span><span class="v">${num(autoV.minutes, 0)} min</span></div>
+              <div class="kv"><span class="k">Mode</span><span class="v">${autoV.dry_run ? "dry-run" : "paper"}</span></div>
+              <div class="kv"><span class="k">Runs</span><span class="v">${num(autoV.runs, 0)}</span></div>
+              <div class="kv"><span class="k">Orders</span><span class="v">${num(autoV.live_orders, 0)} live / ${num(autoV.dry_orders, 0)} dry</span></div>
+              <p class="muted small" style="margin-top:8px">${esc(autoV.result || "No run yet.")}</p>`
+            : errorBox("Automation", auto.error)}
+            <div class="row" style="margin-top:10px"><a class="btn small" href="#" data-goto="risk">Risk controls</a></div>
+          </div>
+        </div>
+      </section>
+    </div>`;
+
+    $$("[data-goto]", root).forEach((a) => a.addEventListener("click", (e) => {
+      e.preventDefault();
+      state.view = a.dataset.goto;
+      render();
+    }));
+  };
+
+  VIEWS.portfolio = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:120px"></div><div class="skeleton" style="min-height:220px"></div></div>`;
+    const [positions, orders, summary] = await Promise.all([
+      safeGet("/api/v2/positions"), safeGet("/api/v2/orders"), safeGet("/api/v2/summary"),
+    ]);
+    if (seq !== viewSeq) return;
+
+    const p = positions.ok ? positions.value : null;
+    const s = summary.ok ? summary.value : null;
+    const avail = !!(p && p.available);
+    const rows = (p && p.positions) || [];
+    const totalMv = rows.reduce((a, x) => a + Math.abs(Number(x.market_value) || 0), 0);
+
+    const summaryStrip = `<section class="grid kpis" aria-label="Account metrics">
+      ${kpi("Equity", avail ? money(p.account.equity) : "—", avail ? p.account.status : "unavailable", avail ? "ok" : "", !avail)}
+      ${kpi("Cash", avail ? money(p.account.cash) : "—", "settled", "", !avail)}
+      ${kpi("Buying power", avail ? money(p.account.bp) : "—", "available", "", !avail)}
+      ${kpi("Positions value", avail ? money(totalMv) : "—", `${rows.length} holding(s)`, "", !avail)}
+      ${kpi("Unrealized P&L", avail ? signedMoney(p.total_unrealized_pl) : "—", "mark-to-market", avail ? tone(p.total_unrealized_pl) : "", !avail)}
+      ${kpi("Drawdown", avail && s && isNum(s.drawdown_pct) ? pctPts(-Math.abs(s.drawdown_pct)) : "—", "from peak", "", !avail)}
+    </section>`;
+
+    const positionsTable = !positions.ok
+      ? errorBox("Positions", positions.error)
+      : !avail
+        ? `<div class="banner warn">Positions unavailable (${esc(p.error || "broker read failed")}). This is not an empty book.</div>`
+        : rows.length
+          ? `<div class="table-wrap"><table class="data">
+              <caption class="sr-only">Open positions</caption>
+              <thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Market value</th><th class="num">Cost</th><th class="num">P&amp;L</th><th class="num">P&amp;L %</th><th class="num">Alloc</th></tr></thead>
+              <tbody>${rows.map((x) => {
+                const up = Number(x.unrealized_pl);
+                return `<tr>
+                  <td class="sym">${esc(x.symbol)}</td><td>${esc(x.side)}</td>
+                  <td class="num">${qty(Number(x.qty))}</td>
+                  <td class="num">${money(Number(x.current_price), 4)}</td>
+                  <td class="num">${money(Number(x.market_value))}</td>
+                  <td class="num">${money(Number(x.cost_basis))}</td>
+                  <td class="num ${cmpClass(up)}">${signedMoney(up)}</td>
+                  <td class="num ${cmpClass(up)}">${pctPts(Number(x.unrealized_pl_pct))}</td>
+                  <td class="num">${totalMv > 0 ? ((Math.abs(Number(x.market_value) || 0) / totalMv) * 100).toFixed(1) + "%" : "—"}</td>
+                </tr>`;
+              }).join("")}</tbody></table></div>`
+          : `<div class="empty">Flat — the paper account holds no positions.</div>`;
+
+    const ordersV = orders.ok ? orders.value : null;
+    const openOrders = (ordersV && ordersV.open) || [];
+    const dbOpen = (ordersV && ordersV.db_open) || [];
+    const hist = (ordersV && ordersV.history) || [];
+
+    root.innerHTML = `<div class="stack">
+      ${summaryStrip}
+      <section class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>Holdings</h2><span class="sub">live paper account</span></div>
+          ${positionsTable}
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Allocation</h2><span class="sub">market value</span></div>
+          ${rows.length ? allocationBlock(rows.map((x) => ({
+            symbol: x.symbol,
+            pct: totalMv > 0 ? (Math.abs(Number(x.market_value) || 0) / totalMv) * 100 : 0,
+          })).sort((a, b) => b.pct - a.pct)) : `<div class="empty">No allocation to display.</div>`}
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Open orders</h2><span class="sub">broker ${openOrders.length} · durable store ${dbOpen.length}</span></div>
+        ${!orders.ok ? errorBox("Orders", orders.error) : (openOrders.length || dbOpen.length) ? `
+          <div class="table-wrap"><table class="data">
+            <caption class="sr-only">Open orders</caption>
+            <thead><tr><th>Symbol</th><th>Side</th><th class="num">Notional</th><th class="num">Qty</th><th>Status</th><th>Client order ID</th><th>Source</th></tr></thead>
+            <tbody>
+              ${openOrders.map((o) => `<tr><td class="sym">${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${money(Number(o.notional || 0))}</td><td class="num">${qty(Number(o.qty || 0))}</td><td>${esc(o.status)}</td><td class="mono small">${esc(o.client_order_id || "—")}</td><td class="muted">broker</td></tr>`).join("")}
+              ${dbOpen.filter((o) => !openOrders.some((b) => b.client_order_id === o.client_order_id)).map((o) => `<tr><td class="sym">${esc(o.symbol)}</td><td>${esc(o.side)}</td><td class="num">${money(Number(o.notional || 0))}</td><td class="num">—</td><td>${esc(o.status)}</td><td class="mono small">${esc(o.client_order_id || "—")}</td><td class="muted">store</td></tr>`).join("")}
+            </tbody></table></div>
+          ${ordersV.open_error ? `<p class="banner warn" style="margin-top:8px">${esc(ordersV.open_error)}</p>` : ""}
+          ${ordersV.db_error ? `<p class="banner warn" style="margin-top:8px">${esc(ordersV.db_error)}</p>` : ""}`
+          : `<div class="empty">No open orders.</div>`}
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Execution history</h2><span class="sub">this process · ${hist.length}</span></div>
+        ${hist.length ? `<div class="table-wrap"><table class="data">
+          <caption class="sr-only">Execution history</caption>
+          <thead><tr><th>Submitted</th><th>Symbol</th><th>Side</th><th class="num">Filled qty</th><th class="num">Avg price</th><th>Status</th><th>Client order ID</th><th>Note</th></tr></thead>
+          <tbody>${hist.slice().reverse().map((x) => `<tr>
+            <td class="mono small">${esc(shortTime(x.ts))}</td><td class="sym">${esc(x.symbol || "—")}</td><td>${esc(x.side || "—")}</td>
+            <td class="num">${qty(Number(x.filled_qty || 0))}</td><td class="num">${x.filled_price ? money(Number(x.filled_price), 4) : "—"}</td>
+            <td class="${x.status === "filled" ? "ok" : x.status === "rejected" || x.status === "unknown" ? "bad" : ""}">${esc(x.status || "—")}</td>
+            <td class="mono small">${esc(x.cid || "—")}</td><td class="muted small">${esc(x.note || "")}</td>
+          </tr>`).join("")}</tbody></table></div>` : `<div class="empty">No executions recorded in this process. Durable order records appear above.</div>`}
+      </section>
+    </div>`;
+  };
+
+  VIEWS.markets = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:90px"></div><div class="skeleton" style="min-height:260px"></div></div>`;
+    const [cfg, quotes] = await Promise.all([
+      safeGet("/api/config/validate"), safeGet("/api/v2/quotes"),
+    ]);
+    if (seq !== viewSeq) return;
+    const c = cfg.ok ? cfg.value : (state.config || {});
+    const symbols = (c.symbols || ["BTC/USD"]).slice(0, 40);
+    const timeframes = ["1Min", "5Min", "15Min", "1H", "1D"];
+    const quoteMap = new Map();
+    if (quotes.ok) quotes.value.quotes.forEach((q) => quoteMap.set(q.symbol, q));
+
+    root.innerHTML = `<div class="stack">
+      <div class="card">
+        <div class="card-head"><h2>Market watch</h2><span class="sub">${quotes.ok ? esc(quotes.value.as_of || "") : "offline"}</span></div>
+        ${quotes.ok ? `<div class="table-wrap"><table class="data">
+          <caption class="sr-only">Watchlist quotes</caption>
+          <thead><tr><th>Symbol</th><th class="num">Last</th><th class="num">Change</th><th class="num">%</th><th>Quality</th></tr></thead>
+          <tbody>${quotes.value.quotes.map(quoteRow).join("")}</tbody></table></div>
+          ${quotes.value.available ? "" : `<p class="banner warn" style="margin-top:8px">Market data provider is not returning bars. Configure paper market-data credentials or DATA_PROVIDER.</p>`}`
+          : errorBox("Watchlist", quotes.error)}
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Candlestick chart</h2><span class="sub" id="chartMeta">—</span></div>
+        <div class="toolbar" style="margin-bottom:12px">
+          <label class="field"><span>Symbol</span><select id="mSymbol">${symbols.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}</select></label>
+          <label class="field"><span>Timeframe</span><select id="mTf">${timeframes.map((t) => `<option value="${t}" ${t === c.timeframe ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+          <label class="field"><span>Bars</span><select id="mLimit">${[60, 120, 240, 480].map((n) => `<option value="${n}" ${n === 120 ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+          <button class="btn primary" id="mLoad" type="button">Load chart</button>
+        </div>
+        <div id="mQuote" class="row" style="margin-bottom:10px"></div>
+        <div id="mChart">${emptyChart("Choose a symbol and load the chart.", 260)}</div>
+        <div id="mQuality" class="muted small" style="margin-top:8px"></div>
+      </div>
+    </div>`;
+
+    const load = async () => {
+      const sym = $("#mSymbol").value;
+      const tf = $("#mTf").value;
+      const limit = Number($("#mLimit").value);
+      $("#chartMeta").textContent = "loading…";
+      $("#mChart").innerHTML = `<div class="skeleton" style="min-height:260px"></div>`;
+      try {
+        const d = await apiGet(`/api/market/bars?symbol=${encodeURIComponent(sym)}&timeframe=${encodeURIComponent(tf)}&limit=${limit}`, { ttl: 0 });
+        if (seq !== viewSeq) return;
+        const last = d.bars[d.bars.length - 1];
+        const q = quoteMap.get(sym);
+        $("#chartMeta").textContent = `${d.symbol} · ${d.timeframe} · ${d.bars.length} bars`;
+        $("#mQuote").innerHTML = `
+          <span class="pill mut">${esc(d.symbol)}</span>
+          <strong class="mono">${last ? money(Number(last.c), Number(last.c) < 10 ? 4 : 2) : "—"}</strong>
+          ${q && q.available ? `<span class="${cmpClass(q.change)} mono">${signedMoney(q.change, 4)} / ${pctPts(q.change_pct)}</span>` : `<span class="muted small">quote unavailable</span>`}`;
+        $("#mChart").innerHTML = candleChart(d.bars, `Candlestick chart for ${d.symbol} ${d.timeframe}`);
+        const quality = d.quality || {};
+        $("#mQuality").innerHTML = quality.ok
+          ? `<span class="pill ok">fresh</span> ${num(quality.rows, 0)} rows · last bar ${timeAgo(Number(last && last.ts))}`
+          : `<span class="pill warn">quality</span> ${esc((quality.issues || []).join("; "))}`;
+      } catch (e) {
+        recordError("/api/market/bars", e);
+        if (seq !== viewSeq) return;
+        $("#chartMeta").textContent = "error";
+        $("#mChart").innerHTML = errorBox("Market data", e);
+        $("#mQuality").textContent = e.message;
+      }
+    };
+    $("#mLoad").addEventListener("click", load);
+    $("#mSymbol").addEventListener("change", load);
+    $("#mTf").addEventListener("change", load);
+    $("#mLimit").addEventListener("change", load);
+    const preferred = symbols.includes("BTC/USD") ? "BTC/USD" : symbols[0];
+    if (preferred) { $("#mSymbol").value = preferred; load(); }
+  };
+
+  VIEWS.strategies = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:160px"></div><div class="skeleton" style="min-height:220px"></div></div>`;
+    const [signals, muse] = await Promise.all([safeGet("/api/v2/signals"), safeGet("/api/v2/muse")]);
+    if (seq !== viewSeq) return;
+    const sigs = signals.ok ? (signals.value.signals || {}) : {};
+    const keys = Object.keys(sigs);
+    const mu = muse.ok ? muse.value : null;
+
+    const actionClass = (a) => a === "BUY" ? "ok" : a === "SELL" ? "bad" : "mut";
+    const cards = keys.map((sym) => {
+      const v = sigs[sym] || {};
+      const a = v.aggregate || { action: "ABSTAIN", score: 0, confidence: 0, reason: "no data" };
+      const rows = v.signals || [];
+      return `<div class="card">
+        <div class="card-head">
+          <h2>${esc(sym)}</h2>
+          <span class="pill ${actionClass(a.action)}">${esc(a.action)}</span>
+        </div>
+        <div class="metric-list">
+          <div class="metric"><div class="k">Score</div><div class="v">${num(a.score, 3)}</div></div>
+          <div class="metric"><div class="k">Confidence</div><div class="v">${num(a.confidence, 3)}</div></div>
+          <div class="metric"><div class="k">Disagreement</div><div class="v">${num(a.disagree, 3)}</div></div>
+        </div>
+        <p class="muted small" style="margin:8px 0">${esc(a.reason || "")}</p>
+        ${rows.length ? `<div class="table-wrap"><table class="data">
+          <caption class="sr-only">Strategy contributions for ${esc(sym)}</caption>
+          <thead><tr><th>Strategy</th><th class="num">Signal</th><th class="num">Confidence</th><th>Reason</th></tr></thead>
+          <tbody>${rows.map((x) => `<tr><td>${esc(x.name || "—")}</td><td class="num ${x.signal > 0 ? "ok" : x.signal < 0 ? "bad" : ""}">${num(x.signal, 3)}</td><td class="num">${num(x.conf, 3)}</td><td class="muted small">${esc(x.reason || "")}</td></tr>`).join("")}</tbody>
+        </table></div>` : ""}
+      </div>`;
+    }).join("");
+
+    root.innerHTML = `<div class="stack">
+      <div class="card">
+        <div class="card-head"><h2>Muse AI</h2><span class="pill ${mu && mu.available ? "ok" : "mut"}">${mu && mu.available ? "available" : "fail-closed"}</span></div>
+        ${mu ? `
+          <div class="kv"><span class="k">Configured</span><span class="v">${mu.enabled ? "yes" : "no"}</span></div>
+          <div class="kv"><span class="k">Model</span><span class="v">${esc(mu.model || "—")}</span></div>
+          <div class="kv"><span class="k">Failures</span><span class="v">${num(mu.failures, 0)}</span></div>
+          <div class="kv"><span class="k">Cooling down</span><span class="v">${mu.cooling_down ? "yes" : "no"}</span></div>
+          <div class="kv"><span class="k">Last error</span><span class="v">${esc(mu.last_error || "—")}</span></div>
+          <p class="muted small" style="margin-top:8px">Decision support only. Unavailable reviews abstain; they never place orders.</p>`
+        : errorBox("Muse status", muse.error)}
+      </div>
+      <div class="row between">
+        <h2 class="section-title" style="margin:0">Signals (${keys.length})</h2>
+        <button class="btn primary" id="runPipeline" type="button">Run pipeline</button>
+      </div>
+      ${keys.length ? `<div class="grid two-even">${cards}</div>` : `<div class="empty"><strong>No signals yet</strong><span>Run the pipeline once market data is available.</span></div>`}
+    </div>`;
+
+    $("#runPipeline").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "Running…";
+      try {
+        await apiPost("/api/pipeline/run", {});
+        toast("Pipeline completed.", "ok");
+        getCache.clear();
+        render();
+      } catch (err) {
+        recordError("/api/pipeline/run", err);
+        toast(err.message, "bad");
+        btn.disabled = false;
+        btn.textContent = "Run pipeline";
+      }
+    });
+  };
+
+  VIEWS.backtest = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:110px"></div><div class="skeleton" style="min-height:260px"></div></div>`;
+    const [cfg, perf] = await Promise.all([safeGet("/api/config/validate"), safeGet("/api/v2/performance")]);
+    if (seq !== viewSeq) return;
+    const c = cfg.ok ? cfg.value : (state.config || {});
+    const symbols = (c.symbols || ["BTC/USD"]).slice(0, 40);
+    const timeframes = ["1Min", "5Min", "15Min", "1H", "1D"];
+
+    root.innerHTML = `<div class="stack">
+      <div class="card">
+        <div class="card-head"><h2>Backtest</h2><span class="sub">fees + slippage charged · no look-ahead</span></div>
+        <div class="toolbar">
+          <label class="field"><span>Symbol</span><select id="bSymbol">${symbols.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("")}</select></label>
+          <label class="field"><span>Timeframe</span><select id="bTf">${timeframes.map((t) => `<option value="${t}" ${t === c.timeframe ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></label>
+          <label class="field"><span>Bars</span><input id="bLimit" type="number" min="60" max="2000" step="10" value="300"></label>
+          <button class="btn primary" id="bRun" type="button">Run backtest</button>
+          <button class="btn ghost" id="bCancel" type="button" disabled>Cancel</button>
+          <button class="btn ghost" id="bWalk" type="button">Walk-forward windows</button>
+        </div>
+        <div id="bStatus" class="muted small" style="margin-top:10px">${perf.ok && perf.value.source === "none" ? esc(perf.value.message) : ""}</div>
+        <div class="progress" style="margin-top:8px"><span id="bProgress" style="width:0%"></span></div>
+      </div>
+      <div id="bResult"></div>
+    </div>`;
+
+    const renderResult = (p) => {
+      if (!p || p.source === "none") {
+        $("#bResult").innerHTML = `<div class="empty"><strong>No completed backtest</strong><span>Run one to see equity, drawdown and benchmark curves.</span></div>`;
+        return;
+      }
+      const curve = p.curve || [];
+      const bench = p.benchmark || [];
+      const dd = drawdownSeries(curve);
+      const m = p.metrics || {};
+      const trades = (p.trades || []).slice(-25).reverse();
+      $("#bResult").innerHTML = `<div class="stack">
+        <section class="grid kpis">
+          ${kpi("Total return", pctFrac(m.total_return), `${esc(p.symbol || "")} · ${esc(p.assumptions && p.assumptions.exec || "")}`, tone(m.total_return))}
+          ${kpi("Sharpe", num(m.sharpe, 2), "per-bar, annualisation not assumed")}
+          ${kpi("Max drawdown", pctFrac(-Math.abs(m.max_dd || 0)), "peak to trough", "warn")}
+          ${kpi("Trades", num(m.trades, 0), "rebalances", "")}
+          ${kpi("Fees + slippage", money(m.fees), "charged", "")}
+          ${kpi("Final equity", money(m.equity), "starting $10,000", "")}
+        </section>
+        <section class="grid two">
+          <div class="card">
+            <div class="card-head"><h2>Equity vs benchmark</h2><span class="sub">${p.benchmark_return !== undefined ? "B&H " + pctFrac(p.benchmark_return) : ""}</span></div>
+            <div class="chart-wrap">${lineChart({
+              series: [
+                { values: curve, color: "var(--accent)", fill: true },
+                { values: bench, color: "var(--faint)", dash: true },
+              ],
+              yFormat: (v) => money(v, 0),
+              ariaLabel: "Backtest equity curve versus buy and hold",
+            })}</div>
+            <div class="legend"><span><i style="background:var(--accent)"></i>Strategy</span><span><i style="background:var(--faint)"></i>Buy &amp; hold</span></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Drawdown</h2><span class="sub">% from peak</span></div>
+            <div class="chart-wrap">${lineChart({
+              series: [{ values: dd, color: "var(--bad)", fill: true }],
+              yFormat: (v) => `${v.toFixed(1)}%`,
+              ariaLabel: "Backtest drawdown",
+            })}</div>
+          </div>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>Recent trades</h2><span class="sub">last ${trades.length}</span></div>
+          ${trades.length ? `<div class="table-wrap"><table class="data">
+            <caption class="sr-only">Backtest trades</caption>
+            <thead><tr><th class="num">Bar</th><th class="num">Price</th><th class="num">Notional change</th><th class="num">Cost</th></tr></thead>
+            <tbody>${trades.map((t) => `<tr><td class="num">${num(t.bar, 0)}</td><td class="num">${money(t.price, 4)}</td><td class="num ${t.dnot > 0 ? "ok" : "bad"}">${signedMoney(t.dnot)}</td><td class="num">${money(t.fee, 4)}</td></tr>`).join("")}</tbody>
+          </table></div>` : `<div class="empty">No trades in this backtest.</div>`}
+          <p class="muted small" style="margin-top:8px">${esc((p.assumptions && p.assumptions.note) || "Past performance is not evidence of future profit.")}</p>
+        </section>
+      </div>`;
+    };
+
+    renderResult(perf.ok ? perf.value : null);
+
+    const pollJob = async (id) => {
+      for (let i = 0; i < 90; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        if (seq !== viewSeq) return;
+        try {
+          const j = await apiGet(`/api/jobs/${id}`, { ttl: 0 });
+          const pct = j.status === "done" ? 100 : j.status === "running" ? 60 : 15;
+          $("#bProgress").style.width = pct + "%";
+          $("#bStatus").textContent = `job ${id} · ${j.status}${j.error ? " · " + j.error : ""}`;
+          if (j.status === "done") {
+            $("#bProgress").style.width = "100%";
+            $("#bStatus").textContent = `job ${id} · done`;
+            renderResult({ source: "latest_backtest_job", ...(j.result || {}) });
+            toast("Backtest complete.", "ok");
+            $("#bRun").disabled = false;
+            $("#bCancel").disabled = true;
+            return;
+          }
+          if (j.status === "failed" || j.status === "canceled") {
+            $("#bStatus").textContent = `job ${id} · ${j.status}${j.error ? ": " + j.error : ""}`;
+            $("#bRun").disabled = false;
+            $("#bCancel").disabled = true;
+            return;
+          }
+        } catch (e) {
+          recordError(`/api/jobs/${id}`, e);
+          $("#bStatus").textContent = `job status unavailable: ${e.message}`;
+          $("#bRun").disabled = false;
+          $("#bCancel").disabled = true;
           return;
         }
-        if (st.status === "failed") { el.querySelector("#bInfo").textContent = "failed: " + st.error; return; }
       }
-      el.querySelector("#bInfo").textContent = "still running; refresh job manually";
-    } catch (e) { toast(e.message); }
-  };
-  el.querySelector("#bGo").onclick = go;
-};
-
-PAGES.Risk = async (el) => {
-  const r = await apiSafe("/api/risk");
-  const v = r.status === "fulfilled" ? r.value : {};
-  el.innerHTML = `
-  <div class="card"><h3>Risk Controls</h3>
-    ${Object.entries(v.limits || {}).map(([k, val]) => `<div class="kv"><span class="k">${esc(k)}</span><b>${typeof val === "number" ? val.toFixed(2) : esc(String(val))}</b></div>`).join("")}
-    <div class="kv"><span class="k">Kill Switch</span><b class="${v.killed ? 'bad' : 'ok'}">${v.killed ? "ENGAGED" : "ARMED"}</b></div>
-  </div>
-  <div class="card"><h3>Emergency Stop</h3>
-    <p class="mut">Blocks all new orders immediately. Existing positions require manual review. Paper trading only.</p>
-    <label>Password <input type="password" id="killPwd" size="10"></label>
-    <button class="btn stop" id="kBtn">Engage Kill Switch</button>
-    <div class="muted" id="kMsg"></div></div>`;
-  el.querySelector("#kBtn").onclick = async () => {
-    if (!confirm("Engage kill switch? This blocks all new orders immediately.")) return;
-    try {
-      await api("/api/kill", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: $("#killPwd").value, reason: "dashboard manual" }) });
-      el.querySelector("#kMsg").textContent = "Kill switch ENGAGED.";
-      el.querySelector("#kBtn").disabled = true;
-    } catch (e) { toast(e.message); }
-  };
-};
-
-PAGES.Errors = async (el) => {
-  const render = async () => {
-    let server = [];
-    try {
-      const l = await api("/api/logs?limit=200");
-      server = l.events.filter(e => e.level === "warning" || e.level === "error").reverse();
-    } catch (e) { server = [{ ts: "-", level: "error", event: "log_fetch_failed", detail: e.message }]; }
-    el.innerHTML = `<div class="card"><h3>Errors <button class="btn secondary" id="ref">Refresh</button> <button class="btn secondary" id="clr">Clear browser list</button></h3>
-      <h4>Browser (this session: failed requests)</h4>
-      ${clientErrors.length ? `<table><tr><th>Time</th><th>Request</th><th>Error</th></tr>
-      ${clientErrors.map(e => `<tr><td class="mut">${e.ts}</td><td>${esc(e.where)}</td><td class="bad">${esc(e.msg)}</td></tr>`).join("")}</table>` : `<p class="mut">No browser errors this session.</p>`}
-      <h4>Server (warnings + errors)</h4>
-      ${server.length ? `<table><tr><th>Time</th><th>Level</th><th>Event</th><th>Detail</th></tr>
-      ${server.map(e => `<tr><td class="mut">${e.ts || ""}</td><td class="bad">${e.level || ""}</td><td>${esc(e.event || "")}</td><td class="mut">${JSON.stringify(e.reason || e.status || e.path || e.detail || "").slice(0, 200)}</td></tr>`).join("")}</table>` : `<p class="ok">No server errors recorded.</p>`}</div>`;
-    el.querySelector("#ref").onclick = render;
-    el.querySelector("#clr").onclick = () => { clientErrors.length = 0; render(); };
-  };
-  await render();
-};
-
-PAGES.Settings = async (el) => {
-  const c = await apiSafe("/api/config/validate");
-  const cv = c.status === "fulfilled" ? c.value : {};
-  el.innerHTML = `<div class="card"><h3>Configuration</h3>
-    <pre>${esc(JSON.stringify(cv, null, 2))}</pre>
-    <p class="mut">Secrets live in .env, never shown. Live trading unavailable by design.</p></div>`;
-};
-
-let clientErrors = [];
-
-async function go() {
-  const nav = $("#sidebarNav"); nav.innerHTML = "";
-  TABS.forEach((t) => {
-    const b = document.createElement("button");
-    b.className = "btn " + (cur === t ? "on" : "");
-    b.innerHTML = `<span class="ic">${ICONS[t] || "•"}</span> ${t}`;
-    b.onclick = () => { cur = t; localStorage.setItem("tab", t); go(); };
-    nav.appendChild(b);
-  });
-  const el = $("#page"); el.innerHTML = "<p class='mut'>Loading…</p>";
-  try { await PAGES[cur](el); } catch (e) { el.innerHTML = `<div class="card bad">Error: ${esc(e.message)}</div>`; }
-  try {
-    const h = await api("/api/health");
-    const c = $("#conn"); c.textContent = h.ok ? "LIVE" : "DEGRADED";
-    c.className = "dot " + (h.ok ? "live" : "");
-    if (h.components && h.components.config) {
-      $("#sysMode").textContent = h.components.config.detail ? "configured" : "paper";
-    }
-  } catch { const c = $("#conn"); c.textContent = "OFFLINE"; c.className = "dot"; }
-  $("#pageHeader").innerHTML = `<h1>${cur}</h1><div class="sub">${cur === "Overview" ? "System overview &amp; automation" : cur === "Market" ? "Market data &amp; charts" : cur === "Signals" ? "Strategy signals &amp; Muse AI status" : cur === "Positions" ? "Paper positions &amp; P&L" : cur === "Backtest" ? "Historical backtesting" : cur === "Risk" ? "Risk controls &amp; emergency stop" : "System configuration"}</div>`;
-}
-
-async function init() {
-  if (!sessionOk) {
-    $("#authModal").style.display = "flex";
-    $("#authBtn").onclick = async () => {
-      const pwd = $("#authPwd").value;
-      try {
-        await api("/api/auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: pwd }) });
-        sessionOk = true;
-        sessionStorage.setItem("authed", "1");
-        savedPwd = pwd;
-        sessionStorage.setItem("authedPwd", pwd);
-        $("#authModal").style.display = "none";
-        go();
-        startRefresh();
-      } catch (e) {
-        $("#authErr").textContent = "Invalid password. Try again.";
-        $("#authPwd").value = "";
-      }
+      $("#bStatus").textContent = "Job is still running. Refresh the page to resume polling.";
+      $("#bRun").disabled = false;
+      $("#bCancel").disabled = true;
     };
-    $("#authPwd").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#authBtn").click(); });
-    return;
+
+    $("#bRun").addEventListener("click", async (e) => {
+      if (seq !== viewSeq) return;
+      const symbol = $("#bSymbol").value;
+      const timeframe = $("#bTf").value;
+      const limit = Math.max(60, Math.min(2000, Number($("#bLimit").value) || 300));
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      $("#bCancel").disabled = false;
+      $("#bProgress").style.width = "10%";
+      $("#bStatus").textContent = "submitting…";
+      try {
+        const r = await apiPost("/api/backtest", { symbol, timeframe, limit });
+        state.lastJob = r.job_id;
+        $("#bStatus").textContent = `job ${r.job_id} · ${r.status}`;
+        pollJob(r.job_id);
+      } catch (err) {
+        recordError("/api/backtest", err);
+        $("#bStatus").textContent = err.message;
+        $("#bProgress").style.width = "0%";
+        btn.disabled = false;
+        $("#bCancel").disabled = true;
+        toast(err.message, "bad");
+      }
+    });
+
+    $("#bCancel").addEventListener("click", async () => {
+      if (!state.lastJob) return;
+      try {
+        await apiPost(`/api/jobs/${state.lastJob}/cancel`, { password: state.pwd });
+        $("#bStatus").textContent = `job ${state.lastJob} · cancel requested`;
+      } catch (err) {
+        toast(err.message, "bad");
+      }
+    });
+
+    $("#bWalk").addEventListener("click", async () => {
+      try {
+        const r = await apiPost("/api/walkforward?n=1000&tr=400&va=200&te=200&step=200", {});
+        const wins = r.windows || [];
+        $("#bResult").innerHTML = `<div class="card"><div class="card-head"><h2>Walk-forward windows</h2><span class="sub">${wins.length} windows</span></div>
+          ${wins.length ? `<div class="table-wrap"><table class="data"><caption class="sr-only">Walk-forward windows</caption>
+          <thead><tr><th class="num">#</th><th>Train</th><th>Validate</th><th>Test</th></tr></thead>
+          <tbody>${wins.map((w, i) => `<tr><td class="num">${i + 1}</td><td class="mono">${esc(JSON.stringify(w.train))}</td><td class="mono">${esc(JSON.stringify(w.val))}</td><td class="mono">${esc(JSON.stringify(w.test))}</td></tr>`).join("")}</tbody>
+          </table></div>` : `<div class="empty">Not enough bars for these windows.</div>`}</div>`;
+      } catch (err) {
+        toast(err.message, "bad");
+      }
+    });
+  };
+
+  VIEWS.risk = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:160px"></div><div class="skeleton" style="min-height:220px"></div></div>`;
+    const [risk, positions, auto] = await Promise.all([
+      safeGet("/api/v2/risk"), safeGet("/api/v2/positions"), safeGet("/api/v2/automate/status"),
+    ]);
+    if (seq !== viewSeq) return;
+    const r = risk.ok ? risk.value : null;
+    const p = positions.ok ? positions.value : null;
+    const a = auto.ok ? auto.value : null;
+    const rows = (p && p.positions) || [];
+    const equity = p && p.account ? Number(p.account.equity) : null;
+    const exposure = rows.reduce((sum, x) => sum + Math.abs(Number(x.market_value) || 0), 0);
+    const exposurePct = isNum(equity) && equity > 0 ? (exposure / equity) * 100 : null;
+
+    const limitRows = r ? Object.entries(r.limits || {}).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${isNum(v) ? num(v, 2) : esc(String(v))}</span></div>`).join("") : "";
+
+    root.innerHTML = `<div class="stack">
+      ${r && r.killed ? banner("bad", "Kill switch engaged. All new orders are blocked until the process restarts.") : banner("ok", "Kill switch armed. Every order is re-checked against all limits before submission.")}
+      ${state.config && state.config.password_required === false ? banner("warn", "Trading controls are locked: set DASHBOARD_PASSWORD on the server and restart to enable orders, the kill switch and automation.") : ""}
+      <section class="grid three">
+        <div class="card">
+          <div class="card-head"><h2>Exposure</h2><span class="sub">paper account</span></div>
+          <div class="kv"><span class="k">Gross exposure</span><span class="v">${p && p.available ? money(exposure) : "—"}</span></div>
+          <div class="kv"><span class="k">Equity</span><span class="v">${p && p.available ? money(equity) : "—"}</span></div>
+          <div class="kv"><span class="k">Exposure / equity</span><span class="v ${exposurePct && exposurePct > 100 ? "warn" : ""}">${pctPts(exposurePct)}</span></div>
+          <div class="kv"><span class="k">Session day P&L</span><span class="v ${r ? tone(r.daily_loss) : ""}">${r ? signedMoney(r.daily_loss) : "—"}</span></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Limits</h2><span class="sub">enforced server-side</span></div>
+          ${r ? limitRows : errorBox("Risk limits", risk.error)}
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Automation</h2><span class="pill ${a && a.running ? "ok" : "mut"}">${a && a.running ? "running" : "off"}</span></div>
+          ${a ? `
+            <div class="kv"><span class="k">Dry run</span><span class="v">${a.dry_run ? "yes" : "no"}</span></div>
+            <div class="kv"><span class="k">Interval</span><span class="v">${num(a.minutes, 0)} min</span></div>
+            <div class="kv"><span class="k">Runs</span><span class="v">${num(a.runs, 0)}</span></div>
+            <div class="kv"><span class="k">Live / dry orders</span><span class="v">${num(a.live_orders, 0)} / ${num(a.dry_orders, 0)}</span></div>
+            <div class="row" style="margin-top:10px">
+              <button class="btn small" id="autoToggle" type="button">${a.running ? "Stop" : "Start"}</button>
+              <button class="btn small ghost" id="autoOnce" type="button">Run once</button>
+            </div>` : errorBox("Automation", auto.error)}
+        </div>
+      </section>
+      <section class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>Concentration</h2><span class="sub">by symbol</span></div>
+          ${rows.length ? `<div class="table-wrap"><table class="data">
+            <caption class="sr-only">Position concentration</caption>
+            <thead><tr><th>Symbol</th><th class="num">Market value</th><th class="num">% equity</th></tr></thead>
+            <tbody>${rows.map((x) => {
+              const pctv = isNum(equity) && equity > 0 ? (Math.abs(Number(x.market_value) || 0) / equity) * 100 : null;
+              return `<tr><td class="sym">${esc(x.symbol)}</td><td class="num">${money(Number(x.market_value))}</td><td class="num ${pctv && pctv > 50 ? "warn" : ""}">${pctH(pctv)}</td></tr>`;
+            }).join("")}</tbody></table></div>` : `<div class="empty">No positions.</div>`}
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Emergency stop</h2><span class="sub">blocks new orders</span></div>
+          <p class="muted small">The kill switch is process-local. It blocks every new submission but does not liquidate existing positions; review them in the Portfolio tab.</p>
+          <div class="row" style="margin-top:10px">
+            <button class="btn danger" id="killBtn" type="button" ${r && r.killed ? "disabled" : ""}>Engage kill switch</button>
+            <button class="btn ghost" id="unlockBtn" type="button">${state.ops ? "Controls unlocked" : "Unlock controls"}</button>
+          </div>
+        </div>
+      </section>
+    </div>`;
+
+    function pctH(v) { return isNum(v) ? v.toFixed(1) + "%" : "—"; }
+
+    const signal = (msg) => { $("#killBtn").insertAdjacentHTML("afterend", `<span class="muted small">${esc(msg)}</span>`); };
+
+    $("#unlockBtn").addEventListener("click", () => { if (!state.ops) openAuth(); });
+
+    $("#killBtn").addEventListener("click", async () => {
+      if (!ensureOps()) return;
+      if (!window.confirm("Engage the kill switch? All new orders will be blocked immediately.")) return;
+      try {
+        await apiPost("/api/kill", { password: state.pwd, reason: "dashboard manual" });
+        toast("Kill switch engaged.", "bad");
+        getCache.clear();
+        render();
+      } catch (e) {
+        recordError("/api/kill", e);
+        toast(e.message, "bad");
+      }
+    });
+
+    const autoToggle = $("#autoToggle");
+    if (autoToggle) autoToggle.addEventListener("click", async () => {
+      if (!ensureOps()) return;
+      const action = a && a.running ? "stop" : "start";
+      autoToggle.disabled = true;
+      try {
+        await apiPost(`/api/automate/${action}`, { password: state.pwd });
+        toast(`Automation ${action === "start" ? "started" : "stopped"}.`, "ok");
+        getCache.clear();
+        render();
+      } catch (e) {
+        recordError(`/api/automate/${action}`, e);
+        toast(e.message, "bad");
+        autoToggle.disabled = false;
+      }
+    });
+
+    const autoOnce = $("#autoOnce");
+    if (autoOnce) autoOnce.addEventListener("click", async () => {
+      if (!ensureOps()) return;
+      autoOnce.disabled = true;
+      try {
+        const res = await apiPost("/api/automate/run-once", { password: state.pwd });
+        toast(`Automation cycle: ${res.result || "done"}`, "ok");
+        getCache.clear();
+        render();
+      } catch (e) {
+        recordError("/api/automate/run-once", e);
+        toast(e.message, "bad");
+        autoOnce.disabled = false;
+      }
+    });
+  };
+
+  VIEWS.activity = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:220px"></div></div>`;
+    const [logs] = await Promise.all([safeGet("/api/logs?limit=300", { ttl: 0 })]);
+    if (seq !== viewSeq) return;
+    const events = logs.ok ? (logs.value.events || []).slice().reverse() : [];
+    const bad = events.filter((e) => e.level === "error" || e.level === "critical");
+    const warn = events.filter((e) => e.level === "warning");
+
+    root.innerHTML = `<div class="stack">
+      <div class="card">
+        <div class="card-head"><h2>Server events</h2><span class="sub">${events.length} recent · ${bad.length} errors · ${warn.length} warnings</span></div>
+        ${logs.ok ? (events.length ? `<div class="table-wrap"><table class="data">
+          <caption class="sr-only">Server log events</caption>
+          <thead><tr><th>Time</th><th>Level</th><th>Event</th><th>Detail</th></tr></thead>
+          <tbody>${events.map((e) => `<tr>
+            <td class="mono small">${esc(String(e.ts || "").slice(0, 19))}</td>
+            <td class="${e.level === "error" || e.level === "critical" ? "bad" : e.level === "warning" ? "warn" : "muted"}">${esc(e.level || "")}</td>
+            <td>${esc(e.event || "")}</td>
+            <td class="muted small">${esc(JSON.stringify(e.reason || e.error || e.path || e.detail || "").slice(0, 240))}</td>
+          </tr>`).join("")}</tbody></table></div>` : `<div class="empty">No server events recorded.</div>`) : errorBox("Server logs", logs.error)}
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Browser request errors</h2><span class="sub">${state.errors.length} this tab</span></div>
+        ${state.errors.length ? `<div class="table-wrap"><table class="data">
+          <caption class="sr-only">Browser request errors</caption>
+          <thead><tr><th>Time</th><th>Request</th><th>Error</th></tr></thead>
+          <tbody>${state.errors.slice().reverse().map((e) => `<tr><td class="mono small">${esc(shortTime(new Date(e.ts).toISOString()))}</td><td class="mono small">${esc(e.where)}</td><td class="bad small">${esc(e.msg)}</td></tr>`).join("")}</tbody>
+        </table></div>` : `<div class="empty">No failed requests in this tab.</div>`}
+      </div>
+    </div>`;
+  };
+
+  VIEWS.settings = async (root, seq) => {
+    root.innerHTML = `<div class="stack"><div class="skeleton" style="min-height:220px"></div></div>`;
+    const [cfg, health, db] = await Promise.all([
+      safeGet("/api/config/validate"), safeGet("/api/health"), safeGet("/api/v2/db"),
+    ]);
+    if (seq !== viewSeq) return;
+    const c = cfg.ok ? cfg.value : null;
+    const h = health.ok ? health.value : null;
+    const d = db.ok ? db.value : null;
+
+    const configRows = c ? Object.entries({
+      "Trading mode": c.trading_mode,
+      "Live trading": c.live ? "ON (blocked)" : "OFF",
+      "Paper orders": c.paper_orders ? "ON" : "OFF",
+      "Symbols": `${c.n_symbols} configured`,
+      "Timeframe": c.timeframe,
+      "Data provider": c.data_provider,
+      "Take profit": `${num(c.take_profit_pct, 2)}%`,
+      "Fee / slippage": `${num(c.fee_pct * 100, 3)}% / ${num(c.slippage_pct * 100, 3)}%`,
+      "Durable store required": c.durable_store_required ? "yes" : "no",
+      "Dashboard password": c.password_required ? "required" : "not set (trading controls locked)",
+    }).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(String(v))}</span></div>`).join("") : "";
+
+    root.innerHTML = `<div class="stack">
+      <section class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>Safe configuration</h2><span class="sub">secrets are never returned</span></div>
+          ${c ? configRows : errorBox("Configuration", cfg.error)}
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Connections</h2><span class="sub">health snapshot</span></div>
+          ${h ? healthRows(h) : errorBox("Health", health.error)}
+          <div class="kv" style="margin-top:8px"><span class="k">API base</span><span class="v mono small">${esc(API_BASE || "same origin")}</span></div>
+          <div class="kv"><span class="k">Build</span><span class="v mono small">static · v7</span></div>
+        </div>
+      </section>
+      <section class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>Durable store</h2><span class="pill ${d && d.ok ? "ok" : "bad"}">${d && d.ok ? "verified" : "not verified"}</span></div>
+          ${d ? `
+            <div class="kv"><span class="k">Backend</span><span class="v">${esc(d.backend || "—")}</span></div>
+            <div class="kv"><span class="k">Configured</span><span class="v">${d.configured ? "yes" : "no"}</span></div>
+            <div class="kv"><span class="k">Schema version</span><span class="v">${esc(d.schema_version ?? "—")} / ${esc(d.expected_version ?? "—")}</span></div>
+            <div class="kv"><span class="k">Signals</span><span class="v">${d.counts ? num(d.counts.signals, 0) : "—"}</span></div>
+            <div class="kv"><span class="k">Backtests</span><span class="v">${d.counts ? num(d.counts.backtests, 0) : "—"}</span></div>
+            <div class="kv"><span class="k">Orders</span><span class="v">${d.counts ? num(d.counts.orders, 0) : "—"}</span></div>
+            ${d.missing_indexes && d.missing_indexes.length ? `<p class="banner bad" style="margin-top:8px">Missing indexes: ${esc(d.missing_indexes.join(", "))}</p>` : ""}
+            ${d.error ? `<p class="banner bad" style="margin-top:8px">${esc(d.error)}</p>` : ""}`
+          : errorBox("Database verification", db.error)}
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Session &amp; appearance</h2><span class="sub">local only</span></div>
+          <div class="row" style="margin-bottom:10px">
+            <button class="btn" id="setTheme" type="button">Toggle theme</button>
+            <button class="btn ghost" id="setLock" type="button">${state.ops ? "Lock controls" : "Unlock controls"}</button>
+          </div>
+          <p class="muted small">The dashboard password is held in memory for this tab only. Refreshing or closing the tab clears it. It is never written to localStorage or the build output.</p>
+          <p class="muted small" style="margin-top:8px">Paper trading only. Live trading is disabled in configuration and rejected at startup.</p>
+        </div>
+      </section>
+    </div>`;
+
+    $("#setTheme").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
+    $("#setLock").addEventListener("click", () => {
+      if (state.ops) lockControls();
+      else openAuth();
+    });
+  };
+
+  /* ---------------- render loop ---------------- */
+  function lockControls() {
+    state.ops = false;
+    state.pwd = "";
+    updateLockButton();
+    toast("Trading controls locked.", "ok");
+    render();
   }
-  go();
-  startRefresh();
-  $("#btnRefresh").onclick = () => { go(); toast("Refreshed"); };
-  $("#btnLogout").onclick = () => { sessionOk = false; sessionStorage.removeItem("authed"); sessionStorage.removeItem("authedPwd"); savedPwd = ""; location.reload(); };
-  setInterval(async () => {
+
+  async function render({ silent = false } = {}) {
+    const seq = ++viewSeq;
+    clearTimeout(pollTimer);
+    const tab = TABS.find((t) => t.id === state.view) || TABS[0];
+    const nav = $("#nav");
+    if (nav) {
+      $$("button[data-tab]", nav).forEach((b) => {
+        b.setAttribute("aria-current", b.dataset.tab === state.view ? "page" : "false");
+      });
+    }
+    $("#pageTitle").textContent = tab.label;
+    $("#pageSubtitle").textContent = tab.sub;
+    document.title = `${tab.label} · KALA-LUND`;
+    if (!silent) window.scrollTo(0, 0);
     try {
-      const h = await api("/api/health");
-      const c = $("#conn"); c.textContent = h.ok ? "LIVE" : "DEGRADED";
-      c.className = "dot " + (h.ok ? "live" : "");
-    } catch {}
-  }, 15000);
-}
+      await VIEWS[state.view]($("#view"), seq);
+    } catch (e) {
+      recordError(tab.label, e);
+      if (seq === viewSeq) $("#view").innerHTML = `<div class="error-state"><strong>View failed to render</strong><span>${esc(e.message)}</span></div>`;
+    }
+    if (seq !== viewSeq) return;
+    state.updatedAt = new Date().toISOString();
+    updateChrome(state.health, state.config);
+    schedulePoll();
+  }
 
-function startRefresh() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => { if (document.visibilityState !== "hidden") go(); }, 60000);
-}
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    const interval = state.view === "overview" ? 20000 : 30000;
+    pollTimer = setTimeout(async () => {
+      if (document.visibilityState === "hidden") { schedulePoll(); return; }
+      await refreshChrome();
+      render({ silent: true });
+    }, interval);
+  }
 
-window.addEventListener("DOMContentLoaded", init);
+  /* ---------------- init ---------------- */
+  async function init() {
+    setTheme(state.theme);
+    const savedView = localStorage.getItem("kl-view");
+    if (savedView && TABS.some((t) => t.id === savedView)) state.view = savedView;
+    buildNav();
+    updateLockButton();
+
+    $("#themeToggle").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
+    $("#btnRefresh").addEventListener("click", async () => {
+      getCache.clear();
+      await refreshChrome();
+      render();
+      toast("Refreshed", "ok");
+    });
+    $("#btnLock").addEventListener("click", () => {
+      if (state.ops) lockControls();
+      else if (state.config && state.config.password_required === false) {
+        toast("Trading controls are locked: DASHBOARD_PASSWORD is not configured on the server.", "warn");
+      } else openAuth();
+    });
+
+    $("#authForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const pwd = $("#authPwd").value;
+      const err = $("#authErr");
+      err.hidden = true;
+      try {
+        await unlock(pwd);
+        getCache.clear();
+        render();
+      } catch (ex) {
+        recordError("/api/auth", ex);
+        err.hidden = false;
+        err.textContent = ex.status === 403 ? "Invalid password." : ex.message;
+      }
+    });
+    $("#authReadonly").addEventListener("click", () => {
+      state.ops = false;
+      state.pwd = "";
+      updateLockButton();
+      closeAuth();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("#authModal").hidden) closeAuth();
+    });
+
+    const cfg = await safeGet("/api/config/validate", { ttl: 0 });
+    if (cfg.ok) state.config = cfg.value;
+    if (cfg.ok && cfg.value.password_required) {
+      openAuth();
+    } else {
+      state.ops = false;
+      updateLockButton();
+    }
+    await refreshChrome();
+    render();
+  }
+
+  window.addEventListener("DOMContentLoaded", init);
+})();

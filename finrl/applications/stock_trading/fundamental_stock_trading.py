@@ -302,8 +302,13 @@ def main():
     processed_full = processed_full.merge(final_ratios, how="left", on=["date", "tic"])
     processed_full = processed_full.sort_values(["tic", "date"])
 
-    # Backfill the ratio data to make them daily
-    processed_full = processed_full.bfill(axis="rows")
+    # Forward-fill the ratio data to make them daily.
+    # NOTE: bfill(axis="rows") is intentionally NOT used, because it would pull
+    # the next (future) quarterly ratio back into earlier daily rows before that
+    # ratio was reported (look-ahead bias). ffill() carries the last reported
+    # ratio forward; leading NaNs before the first report stay missing and are
+    # handled explicitly by fillna(0) below.
+    processed_full = processed_full.ffill(axis="rows")
 
     # Calculate P/E, P/B and dividend yield using daily closing price
     processed_full["PE"] = processed_full["close"] / processed_full["EPS"]

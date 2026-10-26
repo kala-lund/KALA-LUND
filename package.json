@@ -10,6 +10,8 @@
     "deploy:pages": "npm run build:pages && wrangler pages deploy dist --project-name finrl-trader"
   },
   "devDependencies": {
+    "@neon/config": "^1.9.4",
+    "@neon/env": "^1.6.5",
     "wrangler": "^3.0.0"
   }
 }

@@ -99,6 +99,8 @@ class Settings:
     api_port: int = 8000
     # CORS origins for dashboard / API access (never use wildcard for authenticated endpoints)
     cors_origins: list[str] = field(default_factory=lambda: ["http://127.0.0.1:8000", "http://localhost:8000"])
+    # Honour X-Forwarded-For only behind a trusted proxy (Railway edge).
+    trust_proxy_headers: bool = False
     dashboard_password: str = ""
     automate_enabled: bool = False
     automate_minutes: int = 15
@@ -110,9 +112,20 @@ class Settings:
     redis_ttl: int = 300
     # Supabase / PostgreSQL (persistent storage for signals, backtests, orders)
     database_url: str = ""
+    # Bounded database connect behaviour: a dead/unreachable database must not
+    # block API startup indefinitely.
+    database_connect_timeout: int = 5
+    database_connect_retries: int = 3
+    # Empty = auto (TLS required for any non-local host, e.g. Neon/Supabase).
+    database_sslmode: str = ""
+    database_application_name: str = "finrl-trader"
     # When true the service refuses to start without a working durable store.
     # Use in production (Railway) so trading state is never kept ephemerally.
     require_durable_store: bool = False
+    # Hard upper bound (seconds) for READ-ONLY broker calls. alpaca-py never
+    # passes a timeout to requests.Session, so without this a hung connection
+    # can block an API request thread indefinitely.
+    broker_read_timeout: float = 10.0
     weights: dict = field(default_factory=lambda: {
         "trend": 1.0, "momentum": 1.0, "mean_reversion": 1.0,
         "volatility": 0.5, "volume_regime": 0.5, "stat_relationship": 0.5})
@@ -160,6 +173,10 @@ def load_settings() -> Settings:
         api_host=_s("API_HOST", "WEB_HOST", default="127.0.0.1"),
         api_port=_i("API_PORT", "WEB_PORT", "PORT", default=8000),
         cors_origins=[o.strip() for o in _s("CORS_ORIGINS", default="http://127.0.0.1:8000,http://localhost:8000").split(",") if o.strip()],
+        # Only trust X-Forwarded-For when the app is behind a proxy that appends
+        # the real client address (Railway). Default false: a direct client can
+        # otherwise rotate the header to bypass password rate limiting.
+        trust_proxy_headers=_b("TRUST_PROXY_HEADERS", False),
         dashboard_password=_s("DASHBOARD_PASSWORD", default=""),
         automate_enabled=_b("AUTOMATE_ENABLED", False),
         automate_minutes=_i("AUTOMATE_INTERVAL_MINUTES", default=15),
@@ -169,7 +186,12 @@ def load_settings() -> Settings:
         redis_url=_s("REDIS_URL", default=""),
         redis_ttl=_i("REDIS_TTL_SECONDS", default=300),
         database_url=_s("DATABASE_URL", default=""),
+        database_connect_timeout=_i("DB_CONNECT_TIMEOUT", "POSTGRES_CONNECT_TIMEOUT", default=5),
+        database_connect_retries=_i("DB_CONNECT_RETRIES", default=3),
+        database_sslmode=_s("DB_SSLMODE", default=""),
+        database_application_name=_s("DB_APPLICATION_NAME", default="finrl-trader"),
         require_durable_store=_b("REQUIRE_DURABLE_STORE", False),
+        broker_read_timeout=_f("BROKER_READ_TIMEOUT_SECONDS", 10.0),
     )
 
 
@@ -187,7 +209,17 @@ def validate_settings(s: Settings) -> list[str]:
         e.append("No symbols configured.")
     if s.automate_minutes < 1:
         e.append("AUTOMATE_INTERVAL_MINUTES must be >= 1.")
+    if "*" in s.cors_origins:
+        e.append("CORS_ORIGINS must not contain '*': list exact frontend origins.")
     if s.require_durable_store and not s.database_url:
         e.append("REQUIRE_DURABLE_STORE is set but DATABASE_URL is missing; "
                  "refusing to run with ephemeral in-memory storage.")
+    if s.database_url:
+        scheme = s.database_url.split(":", 1)[0].strip().lower()
+        if scheme not in ("postgresql", "postgres"):
+            e.append("DATABASE_URL must be a postgresql:// or postgres:// URI.")
+        if s.database_connect_timeout < 1:
+            e.append("DB_CONNECT_TIMEOUT must be >= 1 second.")
+        if s.database_connect_retries < 1:
+            e.append("DB_CONNECT_RETRIES must be >= 1.")
     return e

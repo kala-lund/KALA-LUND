@@ -21,11 +21,17 @@
 #     2026-12-01). Revisit / migrate to Infrastructure as Code before that date.
 #
 # Required Railway service variables (dashboard, names only):
-#   DATABASE_URL        - Supabase *Session Pooler* DSN (required: durable state).
-#                         The direct db.<ref>.supabase.co host is IPv6-only and is
-#                         unreachable from Railway - use
-#                         postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres
+#   DATABASE_URL        - Neon *pooled* DSN (required: durable state).
+#                         Use the -pooler host from the Neon console; it is
+#                         IPv4-reachable (Railway cannot reach IPv6-only hosts).
+#                         Add ?sslmode=require (also enforced by the app for
+#                         non-local hosts). See docs/DEPLOYMENT_NEON.md.
+#   DATABASE_URL_UNPOOLED - optional Neon direct DSN for migrations/admin only.
+#   REQUIRE_DURABLE_STORE - set "true" in production; startup fails closed
+#                         instead of silently using in-memory storage.
 #   CORS_ORIGINS        - comma-separated frontend origins, e.g. https://<project>.pages.dev
+#   TRUST_PROXY_HEADERS - set "true" behind Railway's edge so per-client rate
+#                         limiting uses the appended X-Forwarded-For address
 #   DASHBOARD_PASSWORD  - gates order / kill-switch / automation endpoints
 #   ALPACA_API_KEY      - Alpaca PAPER key id (optional until market data is needed)
 #   ALPACA_API_SECRET   - Alpaca PAPER secret (optional until market data is needed)

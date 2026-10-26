@@ -165,8 +165,13 @@ def qty(v: object) -> float:
     return q
 
 
+_DSN_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s:/@]+:[^\s@/]*@")
+_SECRET_KV_RE = re.compile(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)\s*[=:]\s*([^\s,;]+)")
+
+
 def safe_msg(exc: BaseException) -> str:
-    m = str(exc)
+    m = _DSN_CRED_RE.sub(r"\1[redacted]@", str(exc))
+    m = _SECRET_KV_RE.sub(r"\1=[redacted]", m)
     if any(h in m.lower() for h in _SECRET_HINTS):
         return f"{type(exc).__name__}: [redacted]"
     return f"{type(exc).__name__}: {m[:300]}"

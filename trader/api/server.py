@@ -9,7 +9,7 @@ from typing import Any
 
 import atexit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -89,12 +89,35 @@ def create_app():
     @app.middleware("http")
     async def _cid(request: Request, call_next):
         set_cid(request.headers.get("X-Request-ID", uuid.uuid4().hex[:8]))
-        return await call_next(request)
+        response = await call_next(request)
+        # Baseline hardening for a dashboard that must never be framed or sniffed.
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        if request.url.path == "/" and response.headers.get(
+                "content-type", "").startswith("text/html"):
+            # The dashboard's only inline script was removed, so scripts must be
+            # same-origin files. API calls are same-origin when FastAPI serves it.
+            response.headers.setdefault(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+                "base-uri 'none'; form-action 'self'")
+        return response
 
     prov = CcxtProvider() if s.data_provider == "ccxt" else AlpacaProvider(s.alpaca_api_key, s.alpaca_api_secret)
     cache = RedisCache(s.cache_max, s.cache_ttl, s.redis_url)
     store = MarketStore(prov, cache, s.fetch_workers)
-    db = DBStore(s.database_url, require_durable=s.require_durable_store)
+    db = DBStore(
+        s.database_url,
+        connect_timeout=s.database_connect_timeout,
+        require_durable=s.require_durable_store,
+        connect_retries=s.database_connect_retries,
+        sslmode=s.database_sslmode,
+        application_name=s.database_application_name,
+    )
     risk = Risk(Limits(s.max_order_notional, s.max_position_notional, s.max_exposure,
                        s.max_concentration, s.max_daily_loss, s.max_drawdown,
                        s.max_open_orders, s.min_buying_power, s.stale_seconds))
@@ -102,7 +125,12 @@ def create_app():
     ai = Muse(s.claude_enabled, s.claude_api_key, s.claude_model, s.claude_base_url,
               s.claude_timeout, s.claude_max_tokens)
     broker = Broker(s.alpaca_api_key, s.alpaca_api_secret, s.alpaca_paper_base_url,
-                    s.enable_paper_orders, broker_environment=s.trading_mode)
+                    s.enable_paper_orders, broker_environment=s.trading_mode,
+                    read_timeout=s.broker_read_timeout)
+    # Release database / cache / broker worker resources on process shutdown.
+    atexit.register(db.close)
+    atexit.register(cache.close)
+    atexit.register(broker.close)
     state: dict = {"signals": {}, "equity": 10000.0, "day_pnl": 0.0, "peak": 10000.0}
 
     # Short-TTL read-only display cache for broker account/positions data.
@@ -187,29 +215,82 @@ def create_app():
             return False
         hits.append(now)
         _rate[key] = hits
+        # Bound memory if a client rotates keys; only expired buckets are pruned.
+        if len(_rate) > 2048:
+            for k in [k for k, v in _rate.items() if not v or now - v[-1] > window]:
+                _rate.pop(k, None)
         return True
 
-    def authed(pw: str, key: str = "default") -> None:
-        if not _rl(key):
+    def _client_ip(request: Request) -> str:
+        # X-Forwarded-For is client-controlled unless a trusted proxy appends the
+        # real address. Honouring it by default would let anyone rotate the header
+        # and bypass the password rate limit. Railway: set TRUST_PROXY_HEADERS=true.
+        if s.trust_proxy_headers:
+            forwarded = request.headers.get("x-forwarded-for", "")
+            if forwarded:
+                # The right-most entry is the one appended by the edge proxy.
+                return forwarded.split(",")[-1].strip()[:64] or "unknown"
+        return (request.client.host if request.client else "unknown")[:64]
+
+    def authed(pw: str, key: str = "default", request: Request | None = None) -> None:
+        # Rate limit per (client, endpoint) so one client cannot lock out others.
+        client = _client_ip(request) if request is not None else "local"
+        if not _rl(f"{key}:{client}"):
             raise HTTPException(429, "Rate limit exceeded. Try again later.")
         a: Auth = check_ops(pw, s.dashboard_password)
         if not a.ok:
             raise HTTPException(403, a.reason)
 
+    def _db_component() -> dict:
+        """Report the durable store truthfully.
+
+        A configured store is actively probed (cached for 5 s) because ``stats()``
+        is query-free: a silently dropped idle connection would otherwise keep
+        /health green until the next write failed. When REQUIRE_DURABLE_STORE is
+        set, an unavailable database is a hard failure (ok=false) rather than a
+        silent in-memory fallback.
+        """
+        stats = db.stats()
+        if not stats.get("configured"):
+            if s.require_durable_store:
+                return {"ok": False, "detail": "durable store required but no DATABASE_URL"}
+            return {"ok": True, "detail": "memory (no DATABASE_URL configured)"}
+        probe = _cached_health("db_probe", db.health_check)
+        if probe.get("status") == "ok":
+            return {"ok": True, "detail": "postgres",
+                    "latency_ms": probe.get("latency_ms")}
+        return {"ok": not s.require_durable_store,
+                "detail": f"postgres unavailable: {probe.get('error') or 'probe failed'}"}
+
+    def _redis_component() -> dict:
+        stats = _cached_health("cache_stats", lambda: cache.stats())
+        backend = str(stats.get("backend", "memory"))
+        if backend == "redis":
+            return {"ok": True, "detail": "redis", "configured": True}
+        if s.redis_url:
+            return {"ok": False, "configured": True,
+                    "detail": "redis unavailable; in-process cache active"}
+        return {"ok": True, "configured": False, "detail": "memory (no REDIS_URL)"}
+
+    def _health_payload(include_extras: bool = True) -> dict:
+        errs = validate_settings(s)
+        dbf, rf = _db_component(), _redis_component()
+        comps: dict[str, dict] = {
+            "config": {"ok": not errs, "detail": "; ".join(errs) or "ok"},
+            "risk_kill": {"ok": not risk.killed, "detail": "engaged" if risk.killed else "ok"},
+            "db": dbf,
+            "redis": rf,
+        }
+        if include_extras:
+            comps["Muse"] = {"ok": True, "detail": "enabled" if ai.available else "disabled/fail-closed"}
+            comps["rl"] = {"ok": True, "detail": _SB3_VERSION}
+        return {"ok": (not errs) and (not risk.killed) and dbf["ok"],
+                "mode": s.trading_mode, "components": comps,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
     @app.get("/api/health")
     def health():
-        errs = validate_settings(s)
-        cache_stats, db_stats = _cached_health("health_stats", lambda: (cache.stats(), db.stats()))
-        return {"ok": not errs and not risk.killed,
-                "components": {
-                    "config": {"ok": not errs, "detail": "; ".join(errs) or "ok"},
-                    "risk_kill": {"ok": not risk.killed, "detail": "engaged" if risk.killed else "ok"},
-                    "Muse": {"ok": True, "detail": "enabled" if ai.available else "disabled/fail-closed"},
-                    "rl": {"ok": True, "detail": _SB3_VERSION},
-                    "redis": {"ok": True, "detail": f"{cache_stats.get('backend','memory')}"},
-                    "db": {"ok": True, "detail": f"{db_stats.get('backend','memory')}"},
-                },
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        return _health_payload(include_extras=True)
 
     @app.get("/api/config/validate")
     def cfg():
@@ -217,7 +298,19 @@ def create_app():
         return {"valid": not errs, "errors": errs, "trading_mode": s.trading_mode,
                 "paper_orders": s.enable_paper_orders, "live": s.enable_live_trading,
                 "symbols": list(s.crypto_symbols), "n_symbols": len(s.crypto_symbols),
-                "timeframe": s.primary_timeframe,
+                "timeframe": s.primary_timeframe, "data_provider": s.data_provider,
+                "take_profit_pct": s.take_profit_pct,
+                "fee_pct": s.fee_pct, "slippage_pct": s.slippage_pct,
+                "password_required": bool(s.dashboard_password),
+                "durable_store_required": s.require_durable_store,
+                "risk": {"max_order_notional": s.max_order_notional,
+                         "max_position_notional": s.max_position_notional,
+                         "max_exposure": s.max_exposure,
+                         "max_concentration": s.max_concentration,
+                         "max_daily_loss": s.max_daily_loss,
+                         "max_drawdown": s.max_drawdown,
+                         "max_open_orders": s.max_open_orders,
+                         "stale_seconds": s.stale_seconds},
                 "automate": {"enabled": s.automate_enabled, "minutes": s.automate_minutes,
                              "dry_run": s.automate_dry_run, "min_conf": s.automate_min_conf}}
 
@@ -228,9 +321,11 @@ def create_app():
     @app.get("/api/market/bars")
     def bars(symbol: str, timeframe: str = "15Min", limit: int = 120):
         try:
-            b = store.bars(v_sym(symbol), timeframe, min(limit, 500))
-            return {"symbol": canon(symbol), "timeframe": timeframe, "bars": b[-120:],
-                    "quality": qcheck(b, TF_MS.get(timeframe, 900_000), s.stale_seconds)}
+            tf = timeframe if timeframe in TF_MS else "15Min"
+            n = max(1, min(int(limit), 500))
+            b = store.bars(v_sym(symbol), tf, n)
+            return {"symbol": canon(symbol), "timeframe": tf, "bars": b[-120:],
+                    "quality": qcheck(b, TF_MS.get(tf, 900_000), s.stale_seconds)}
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, safe_msg(exc))
 
@@ -245,7 +340,7 @@ def create_app():
     @app.post("/api/backtest")
     def bt(req: BTReq):
         def _job():
-            b = store.bars(v_sym(req.symbol), req.timeframe, min(req.limit, 2000))
+            b = store.bars(v_sym(req.symbol), req.timeframe, min(max(1, req.limit), 2000))
             f = features(b)
             w = []
             for i in range(len(b)):
@@ -253,10 +348,27 @@ def create_app():
                 g = Trend().run(req.symbol, sub) if len(sub) >= 51 else None
                 w.append(g.signal * 0.5 if g else 0.0)
             r = bt_run(b, w, 10000.0, s.fee_pct, s.slippage_pct)
+            # Benchmark: buy-and-hold the same instrument over the same bars with
+            # no fees. Valid prices only, so it aligns with bt.run's curve.
+            pxs: list[float] = []
+            ts: list[int] = []
+            for bar in b:
+                try:
+                    px = float(bar["c"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if px <= 0:
+                    continue
+                pxs.append(px)
+                ts.append(int(bar.get("ts", 0) or 0))
+            bench = [round(10000.0 * p / pxs[0], 2) for p in pxs] if pxs else []
+            bench_ret = (bench[-1] / 10000.0 - 1.0) if bench else 0.0
             # Persist backtest to DB
             db.save_backtest(req.symbol, req.timeframe, r.metrics, r.assumptions)
             return {"metrics": r.metrics, "curve": r.curve, "trades": r.trades[:200],
-                    "assumptions": r.assumptions, "symbol": req.symbol}
+                    "assumptions": r.assumptions, "symbol": req.symbol,
+                    "benchmark": bench, "curve_ts": ts[:len(r.curve)],
+                    "benchmark_return": round(bench_ret, 6)}
         j = jobs.submit("backtest", _job)
         return {"job_id": j.id, "status": j.status}
 
@@ -272,8 +384,13 @@ def create_app():
         return vars(j)
 
     @app.post("/api/jobs/{jid}/cancel")
-    def job_cancel(jid: str, password: str = ""):
-        authed(password, "cancel")
+    def job_cancel(jid: str, request: Request, req: dict[str, Any] | None = Body(default=None)):
+        """Cancel a queued/running job.
+
+        The password travels in the JSON body, never in the URL/query string,
+        so it cannot leak into proxy access logs or browser history.
+        """
+        authed((req or {}).get("password", ""), "cancel", request)
         return {"canceled": jobs.cancel(jid)}
 
     @app.get("/api/risk")
@@ -281,15 +398,15 @@ def create_app():
         return {"killed": risk.killed, "limits": vars(risk.lim)}
 
     @app.post("/api/kill")
-    def kill(req: dict):
-        authed(req.get("password", ""), "kill")
+    def kill(request: Request, req: dict):
+        authed(req.get("password", ""), "kill", request)
         risk.trip(req.get("reason", "manual"))
         log("kill", level="warning", reason=req.get("reason", "manual"))
         return {"killed": True}
 
     @app.post("/api/orders")
-    def orders(req: OrderReq):
-        authed(req.password, "orders")
+    def orders(request: Request, req: OrderReq):
+        authed(req.password, "orders", request)
         try:
             sym, notional = v_sym(req.symbol), v_qty(req.notional)
             acct = live_acct()
@@ -300,15 +417,42 @@ def create_app():
                 return {"approved": False, "reasons": d.reasons}
             f = broker.send(sym, req.side, notional=notional, cid=cid)
             log("order", symbol=sym, side=req.side, status=f.status)
-            # Persist order to DB
-            db.save_order(sym, req.side, notional, f.status, f.cid or "")
+
+            def _persist() -> str | None:
+                """Persist the order record without ever changing the execution verdict.
+
+                With REQUIRE_DURABLE_STORE a failed write raises. That must not turn
+                a confirmed submission into an HTTP 400 nor delay the kill switch on
+                an ambiguous outcome, so the caller reports it separately.
+                """
+                try:
+                    db.save_order(sym, req.side, notional, f.status, f.cid or "")
+                    return None
+                except Exception as exc:  # noqa: BLE001 - report, don't mask the order
+                    msg = safe_msg(exc)
+                    log("order_persist_failed", level="error", symbol=sym,
+                        cid=f.cid, status=f.status, error=msg)
+                    return msg
+
             if f.status == "unknown":
+                # Fail closed before any I/O: the order may exist at the broker.
                 risk.trip("Order outcome unknown; reconciliation required.")
-                return {"approved": False, "order": vars(f), "reconcile_required": True}
+                persist_err = _persist()
+                out = {"approved": False, "order": vars(f), "reconcile_required": True}
+                if persist_err:
+                    out["persistence_error"] = persist_err
+                return out
+            persist_err = _persist()
             if f.status not in ("filled", "partially_filled", "submitted", "accepted",
                                 "new", "pending_new", "held"):
-                return {"approved": False, "order": vars(f), "execution_rejected": True}
-            return {"approved": True, "order": vars(f)}
+                out = {"approved": False, "order": vars(f), "execution_rejected": True}
+                if persist_err:
+                    out["persistence_error"] = persist_err
+                return out
+            out = {"approved": True, "order": vars(f)}
+            if persist_err:
+                out["persistence_error"] = persist_err
+            return out
         except PermissionError as exc:
             raise HTTPException(409, str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -318,6 +462,8 @@ def create_app():
     def pos(req: dict = {}):
         # positions is read-only account state; no auth required.
         # Served through the short-TTL display cache to avoid repeated Alpaca calls.
+        # Degrades honestly when the broker is unreachable (200 + available=false +
+        # error) instead of a 502 that the dashboard would silently show as "Flat".
         def _fetch_positions():
             try:
                 a = broker.account()
@@ -325,57 +471,61 @@ def create_app():
                 total_up = sum(float(p.get("unrealized_pl", 0.0) or 0.0) for p in pos_list)
                 total_cost = sum(float(p.get("cost_basis", 0.0) or 0.0) for p in pos_list)
                 total_up_pct = (total_up / total_cost * 100.0) if total_cost else 0.0
-                return {"account": a, "positions": pos_list,
+                return {"account": a, "positions": pos_list, "available": True, "error": None,
                         "total_unrealized_pl": round(total_up, 2),
                         "total_unrealized_pl_pct": round(total_up_pct, 2)}
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(502, safe_msg(exc))
+            except Exception as exc:  # noqa: BLE001 - broker read failure must not 502 the widget
+                return {"account": None, "positions": [], "available": False,
+                        "error": safe_msg(exc),
+                        "total_unrealized_pl": 0.0, "total_unrealized_pl_pct": 0.0}
         return _cached_display("positions", _fetch_positions)
 
     @app.post("/api/auth")
-    def auth(req: dict = {}):
+    def auth(request: Request, req: dict = {}):
         """Session password gate. Returns 200 if password correct, 403 otherwise.
         If no DASHBOARD_PASSWORD is configured, access is granted (local dev).
-        Rate-limited to prevent password brute-force."""
+        Rate-limited per client to prevent password brute-force."""
         if s.dashboard_password:
-            if not _rl("auth", limit=10, window=60.0):
+            if not _rl(f"auth:{_client_ip(request)}"):
                 raise HTTPException(429, "Rate limit exceeded. Try again later.")
             a: Auth = check_ops(req.get("password", ""), s.dashboard_password)
             if not a.ok:
                 raise HTTPException(403, a.reason)
-        return {"ok": True}
+        return {"ok": True, "password_required": bool(s.dashboard_password)}
 
     @app.get("/api/automate/status")
     def a_status():
         return vars(auto.st)
 
     @app.post("/api/automate/start")
-    def a_start(req: dict):
-        authed(req.get("password", ""), "automate")
+    def a_start(request: Request, req: dict):
+        authed(req.get("password", ""), "automate", request)
         return vars(auto.start())
 
     @app.post("/api/automate/stop")
-    def a_stop(req: dict):
-        authed(req.get("password", ""), "automate")
+    def a_stop(request: Request, req: dict):
+        authed(req.get("password", ""), "automate", request)
         return vars(auto.stop())
 
     @app.post("/api/automate/run-once")
-    def a_once(req: dict):
-        authed(req.get("password", ""), "automate")
+    def a_once(request: Request, req: dict):
+        authed(req.get("password", ""), "automate", request)
         return auto.once()
 
     # ===== V2 API (versioned, minimal) ============
     @app.get("/api/v2/health")
     def api_health():
-        cs, ds = _cached_health("v2_health_stats", lambda: (cache.stats(), db.stats()))
-        errs = validate_settings(s)
-        return {"ok": not errs and not risk.killed, "mode": s.trading_mode,
-                "components": {
-                    "config": {"ok": not errs, "detail": "; ".join(errs) or "ok"},
-                    "risk_kill": {"ok": not risk.killed, "detail": "engaged" if risk.killed else "ok"},
-                    "db": {"ok": True, "detail": ds.get("backend", "unknown")},
-                    "redis": {"ok": True, "detail": cs.get("backend", "unknown")},
-                }}
+        # Liveness for the platform router (Railway healthcheck): always HTTP 200
+        # once the process is up; the body's "ok" reflects real dependency state.
+        return _health_payload(include_extras=True)
+
+    @app.get("/health")
+    @app.get("/healthz")
+    def health_readiness():
+        # Readiness for external monitors/uptime checks: HTTP 503 when degraded,
+        # 200 when healthy. Same body as /api/v2/health.
+        body = _health_payload(include_extras=True)
+        return JSONResponse(status_code=200 if body["ok"] else 503, content=body)
 
     @app.get("/api/v2/market")
     def api_market():
@@ -389,10 +539,14 @@ def create_app():
             try:
                 a = broker.account()
                 pos_list = broker.positions_detail()
-                return {"account": a, "positions": pos_list,
-                        "total_unrealized_pl": round(sum(float(p.get("unrealized_pl", 0.0) or 0.0) for p in pos_list), 2)}
-            except Exception as exc:  # noqa: BLE001
-                raise HTTPException(502, safe_msg(exc))
+                return {"available": True, "error": None, "account": a,
+                        "positions": pos_list,
+                        "total_unrealized_pl": round(sum(float(p.get("unrealized_pl", 0.0) or 0.0) for p in pos_list), 2),
+                        "positions_value": round(sum(float(p.get("market_value", 0.0) or 0.0) for p in pos_list), 2)}
+            except Exception as exc:  # noqa: BLE001 - report, never fake a flat book
+                return {"available": False, "error": safe_msg(exc),
+                        "account": None, "positions": [],
+                        "total_unrealized_pl": None, "positions_value": None}
         return _cached_display("v2_positions", _fetch_v2_positions)
 
     @app.get("/api/v2/signals")
@@ -420,23 +574,44 @@ def create_app():
     # ===== V2 dashboard summary / orders / muse / performance ============
     def _equity_snapshot():
         def _fetch():
+            err = None
             try:
                 a = broker.account()
-            except Exception:  # noqa: BLE001 - credentials may be absent; fail gracefully
-                a = {"equity": state["equity"], "bp": state["equity"], "status": "unknown", "pdt": False}
-            eq = float(a.get("equity", state["equity"]) or 0.0)
-            peak = max(state.get("peak", eq), eq)
-            dd = ((peak - eq) / peak * 100.0) if peak > 0 else 0.0
+            except Exception as exc:  # noqa: BLE001 - credentials may be absent
+                a, err = None, safe_msg(exc)
             try:
                 pos_list = broker.positions_detail()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 pos_list = []
+                err = err or safe_msg(exc)
+            if a is None:
+                # Never invent equity/P&L: report the data as unavailable.
+                return {"available": False, "source": "unavailable",
+                        "error": err or "broker account unavailable",
+                        "equity": None, "cash": None, "buying_power": None,
+                        "day_pnl": None, "unrealized_pl": None,
+                        "peak": None, "drawdown_pct": None,
+                        "positions": 0, "positions_value": None,
+                        "exposure_pct": None, "status": "unknown",
+                        "take_profit_pct": s.take_profit_pct,
+                        "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            eq = float(a.get("equity", 0.0) or 0.0)
+            peak = max(state.get("peak", eq), eq)
+            dd = ((peak - eq) / peak * 100.0) if peak > 0 else 0.0
             up = sum(float(p.get("unrealized_pl", 0.0) or 0.0) for p in pos_list)
-            return {"equity": round(eq, 2), "day_pnl": round(state.get("day_pnl", 0.0), 2),
+            pos_value = sum(float(p.get("market_value", 0.0) or 0.0) for p in pos_list)
+            return {"available": True, "source": "broker", "error": err,
+                    "equity": round(eq, 2),
+                    "cash": round(float(a.get("cash", 0.0) or 0.0), 2),
+                    "day_pnl": round(float(a.get("day_pnl", 0.0) or 0.0), 2),
                     "peak": round(peak, 2), "drawdown_pct": round(dd, 2),
-                    "unrealized_pl": round(up, 2), "buying_power": float(a.get("bp", 0.0) or 0.0),
+                    "unrealized_pl": round(up, 2),
+                    "buying_power": round(float(a.get("bp", 0.0) or 0.0), 2),
+                    "positions_value": round(pos_value, 2),
+                    "exposure_pct": round((pos_value / eq * 100.0) if eq > 0 else 0.0, 2),
                     "status": a.get("status", "unknown"), "positions": len(pos_list),
-                    "take_profit_pct": s.take_profit_pct}
+                    "take_profit_pct": s.take_profit_pct,
+                    "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         return _cached_display("equity_snapshot", _fetch)
 
     @app.get("/api/v2/summary")
@@ -447,14 +622,92 @@ def create_app():
     def api_orders_v2():
         def _fetch():
             open_orders, oerr = broker.get_open_orders()
-            hist = [vars(f) for f in broker.history][-100:]
+            hist = [vars(f) for f in list(broker.history)][-100:]
             try:
                 db_open, derr = db.get_open_orders()
             except Exception:  # noqa: BLE001
                 db_open, derr = [], "db open-orders read unavailable"
             return {"open": open_orders or [], "open_error": oerr,
-                    "history": hist, "db_open": db_open, "db_error": derr}
+                    "history": hist, "db_open": db_open, "db_error": derr,
+                    "broker_available": oerr is None,
+                    "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         return _cached_display("v2_orders", _fetch)
+
+    @app.get("/api/v2/quotes")
+    def api_quotes_v2():
+        """Watchlist quote snapshot for the configured universe.
+
+        Uses the cached market store; per-symbol failures are reported as
+        ``available=false`` rather than being silently dropped or zero-filled.
+        """
+        def _fetch():
+            symbols = list(s.crypto_symbols)[:8]
+            tf = s.primary_timeframe
+            try:
+                raw = store.many(symbols, tf, s.fetch_bars)
+            except Exception as exc:  # noqa: BLE001 - batch failure, report once
+                return {"available": False, "error": safe_msg(exc),
+                        "timeframe": tf, "quotes": [],
+                        "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            quotes = []
+            for sym in symbols:
+                data = raw.get(sym)
+                if isinstance(data, Exception):
+                    quotes.append({"symbol": sym, "available": False,
+                                   "error": safe_msg(data)})
+                    continue
+                if not data:
+                    quotes.append({"symbol": sym, "available": False,
+                                   "error": "no bars returned"})
+                    continue
+                last = data[-1]
+                window = data[-min(96, len(data)):]
+                first = window[0]
+                try:
+                    last_px = float(last["c"])
+                    first_px = float(first["c"])
+                except (TypeError, ValueError, KeyError):
+                    quotes.append({"symbol": sym, "available": False,
+                                   "error": "malformed bar"})
+                    continue
+                change = last_px - first_px
+                quotes.append({
+                    "symbol": sym, "available": True, "error": None,
+                    "last": round(last_px, 6),
+                    "change": round(change, 6),
+                    "change_pct": round((change / first_px * 100.0) if first_px else 0.0, 4),
+                    "ts": int(last.get("ts", 0) or 0),
+                    "bars": len(data),
+                    "window_bars": len(window),
+                    "quality": qcheck(data, TF_MS.get(tf, 900_000), s.stale_seconds),
+                })
+            return {"available": any(q["available"] for q in quotes),
+                    "error": None, "timeframe": tf, "quotes": quotes,
+                    "as_of": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        return _cached_display("quotes", _fetch)
+
+    @app.get("/api/v2/db")
+    def api_db_v2():
+        """Sanitized durable-store verification (schema, indexes, row counts)."""
+        def _fetch():
+            stats = db.stats()
+            report: dict = {"configured": bool(s.database_url),
+                            "backend": stats.get("backend"),
+                            "degraded": stats.get("degraded"),
+                            "durable": bool(stats.get("durable")),
+                            "require_durable": s.require_durable_store,
+                            "error": stats.get("error")}
+            if not s.database_url:
+                report["ok"] = not s.require_durable_store
+                report["detail"] = "no DATABASE_URL configured"
+                return report
+            try:
+                report.update(db.verify())
+            except Exception as exc:  # noqa: BLE001 - never leak a DSN
+                report["ok"] = False
+                report["error"] = safe_msg(exc)
+            return report
+        return _cached_health("db_verify", _fetch)
 
     @app.get("/api/v2/muse")
     def api_muse_v2():
@@ -467,11 +720,15 @@ def create_app():
         best = None
         for j in reversed(list(jobs.jobs.values())):
             if j.kind == "backtest" and j.status == "done" and j.result:
-                best = j.result; break
+                best = j.result
+                break
         if best:
             return {"source": "latest_backtest_job", "symbol": best.get("symbol"),
                     "metrics": best.get("metrics"), "assumptions": best.get("assumptions"),
-                    "curve": best.get("curve")}
+                    "curve": best.get("curve"), "benchmark": best.get("benchmark"),
+                    "curve_ts": best.get("curve_ts"),
+                    "benchmark_return": best.get("benchmark_return"),
+                    "trades": best.get("trades", [])}
         return {"source": "none",
                 "message": "No completed backtest. Run one from the Backtest tab."}
 

@@ -76,6 +76,19 @@ function main() {
     "utf8"
   );
 
+  // Tighten connect-src to the actual API origin. The checked-in _headers keeps
+  // https: as a manual-deploy fallback, but a generated bundle should not be
+  // allowed to exfiltrate to an arbitrary HTTPS host.
+  const headersPath = path.join(OUT, "_headers");
+  if (fs.existsSync(headersPath)) {
+    const connectSrc = apiBase ? `'self' ${new URL(apiBase).origin}` : "'self'";
+    const headers = fs.readFileSync(headersPath, "utf8").replace(
+      /connect-src 'self' https:;/,
+      `connect-src ${connectSrc};`
+    );
+    fs.writeFileSync(headersPath, headers, "utf8");
+  }
+
   console.log(`build_frontend: wrote ${path.relative(ROOT, OUT)} (API_BASE_URL=${apiBase || "<same origin>"})`);
 }
 
